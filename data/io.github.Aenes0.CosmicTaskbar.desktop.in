@@ -1,0 +1,17 @@
+[Desktop Entry]
+Name=Taskbar
+Name[pt_BR]=Barra de tarefas
+Comment=App tray as on Windows 11: window previews on hover, jump lists, badges
+Comment[pt_BR]=Bandeja de apps como a do Windows 11: prévia das janelas ao passar o mouse, listas de atalhos, contadores
+Type=Application
+Exec=@bindir@/cosmic-ext-applet-taskbar
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;App;Tray;Task;Bar;Taskbar;Windows;
+Icon=com.system76.CosmicAppList
+NoDisplay=true
+X-CosmicApplet=true
+X-MinimizeApplet=5
+X-OverflowPriority=100
+X-OverflowMinSize=4
+X-HostWaylandDisplay=true

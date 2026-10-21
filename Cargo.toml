@@ -1,0 +1,51 @@
+[package]
+name = "cosmic-ext-applet-taskbar"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Windows 11 style taskbar for COSMIC: window previews on hover, jump lists, one row of pinned and open apps"
+
+[dependencies]
+anyhow = "1.0.102"
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "c0cff4d" }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", default-features = false, features = [
+    "client",
+], rev = "c0cff4d" }
+futures = "0.3"
+image = { version = "0.25.9", default-features = false }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "dbus-config",
+    "desktop",
+    "desktop-systemd-scope",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "winit",
+] }
+memmap2 = "0.9.10"
+fastrand = "2.3.0"
+rustix = { version = "1.1", features = ["fs", "process"] }
+rustc-hash = "2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+switcheroo-control = { git = "https://github.com/pop-os/dbus-settings-bindings" }
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1"
+tracing-log = "0.2.0"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+url = "2.5.8"
+zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+lto = "thin"
+
+# Same pins as cosmic-applets epoch-1.10.0, to match the installed panel.
+[patch."https://github.com/smithay/client-toolkit.git"]
+sctk = { package = "smithay-client-toolkit", version = "0.20.0" }
+
+[patch."https://github.com/pop-os/cosmic-protocols"]
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c0cff4d" }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c0cff4d" }
