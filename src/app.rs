@@ -467,6 +467,7 @@ pub enum Message {
     GroupClick(u32, window::Id),
     IconHover(u32, window::Id, bool),
     PreviewHover(bool),
+    PointerLeft(window::Id),
     HoverSettled(u64),
     RefreshPreview,
     Badge(BadgeUpdate),
@@ -1285,6 +1286,19 @@ impl cosmic::Application for Taskbar {
                     return after(HOVER_CLOSE, Message::HoverSettled(self.hover_gen));
                 }
             }
+            Message::PointerLeft(id) => {
+                // Out of a surface fast, past its edge, its widgets may keep
+                // the pointer's last place inside them and never see it
+                // leave: the surface's own event says it.
+                if self.popup.as_ref().is_some_and(|p| p.id == id && p.popup_type == PopupType::Preview) {
+                    return self.update(Message::PreviewHover(false));
+                }
+                if self.hover.is_some_and(|(_, parent)| parent == id) {
+                    self.hover = None;
+                    self.hover_gen += 1;
+                    return after(HOVER_CLOSE, Message::HoverSettled(self.hover_gen));
+                }
+            }
             Message::HoverSettled(hover_gen) => {
                 if hover_gen != self.hover_gen
                     || (self.preview_hovered && self.preview_of().is_some())
@@ -1668,6 +1682,22 @@ impl cosmic::Application for Taskbar {
                             if info.app_id.is_empty() {
                                 return Task::none();
                             }
+                            // A window brought to the front elsewhere, as by a
+                            // click on it, puts the previews away.
+                            let was_active = self.active_list.iter().chain(&self.pinned_list).any(|item| {
+                                item.toplevels.iter().any(|(t, _)| {
+                                    t.foreign_toplevel == info.foreign_toplevel
+                                        && t.state.contains(&State::Activated)
+                                })
+                            });
+                            let mut closing = Task::none();
+                            if info.state.contains(&State::Activated)
+                                && !was_active
+                                && !self.preview_hovered
+                                && self.preview_of().is_some()
+                            {
+                                closing = self.close_preview();
+                            }
                             if info.state.contains(&State::Activated) {
                                 if let Some(item) = self.active_list.iter().chain(&self.pinned_list).find(
                                     |item| item.toplevels.iter().any(|(t, _)| t.foreign_toplevel == info.foreign_toplevel),
@@ -1733,6 +1763,7 @@ impl cosmic::Application for Taskbar {
                                     });
                                 }
                             }
+                            return closing;
                         }
                     },
                     WaylandUpdate::Workspace(workspaces) => self.active_workspaces = workspaces,
@@ -2654,6 +2685,9 @@ impl cosmic::Application for Taskbar {
                 cosmic::iced::core::Event::Mouse(
                     cosmic::iced::core::mouse::Event::ButtonPressed(_),
                 ) => Some(Message::Pressed(id)),
+                cosmic::iced::core::Event::Mouse(cosmic::iced::core::mouse::Event::CursorLeft) => {
+                    Some(Message::PointerLeft(id))
+                }
                 _ => None,
             }),
             rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
