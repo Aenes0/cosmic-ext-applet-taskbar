@@ -445,8 +445,15 @@ pub struct Taskbar {
     hover_gen: u64,
     badges: Badges,
     /// `COSMIC_TASKBAR_PREVIEW`: an app whose previews open by themselves
-    /// once, to take screenshots.
+    /// once, to take screenshots; they stay, whatever comes to the front.
     preview_on_start: Option<String>,
+    preview_test: bool,
+    /// Windows whose picture is on its way: not asked for again until it
+    /// comes, so a slow capture never piles up.
+    capturing: Vec<ExtForeignToplevelHandleV1>,
+    /// App ids that no `.desktop` file has, after reading them all again
+    /// once: the next window of the same app doesn't read them again.
+    unknown_app_ids: rustc_hash::FxHashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -468,6 +475,7 @@ pub enum Message {
     IconHover(u32, window::Id, bool),
     PreviewHover(bool),
     PointerLeft(window::Id),
+    PreviewOnStart,
     HoverSettled(u64),
     RefreshPreview,
     Badge(BadgeUpdate),
@@ -897,11 +905,13 @@ impl Taskbar {
             appid.clone()
         } else {
             // Update desktop entries in case it was not found.
-            self.update_desktop_entries();
+            if self.unknown_app_ids.insert(info.app_id.clone()) {
+                self.update_desktop_entries();
+            }
             if let Some(appid) = fde::find_app_by_id(&self.desktop_entries, unicase_appid) {
                 appid.clone()
             } else {
-                tracing::error!(id = info.app_id, "could not find desktop entry for app");
+                tracing::debug!(id = info.app_id, "could not find desktop entry for app");
                 let mut fallback_entry = fde::DesktopEntry::from_appid(info.app_id.clone());
                 // proton opens games as steam_app_X, where X is either
                 // the steam appid or "default". games with a steam appid
@@ -962,14 +972,29 @@ impl Taskbar {
         })
     }
 
-    /// Asks for a new picture of each of the app's windows.
-    fn capture_windows(&self, id: u32) {
-        let (Some(item), Some(tx)) = (self.item(id), self.wayland_sender.as_ref()) else {
+    /// Asks for a new picture of each of the app's windows: not of one
+    /// minimized that has its picture already, as it doesn't change, nor
+    /// of one whose last picture hasn't come yet.
+    fn capture_windows(&mut self, id: u32) {
+        let Some(tx) = self.wayland_sender.clone() else {
             return;
         };
-        for (info, _) in &item.toplevels {
-            if self.is_on_current_monitor_and_workspace(info) {
-                let _ = tx.send(WaylandRequest::Screencopy(info.foreign_toplevel.clone()));
+        let Some(item) = self.item(id) else {
+            return;
+        };
+        let wanted: Vec<_> = item
+            .toplevels
+            .iter()
+            .filter(|(info, img)| {
+                self.is_on_current_monitor_and_workspace(info)
+                    && !(img.is_some() && info.state.contains(&State::Minimized))
+                    && !self.capturing.contains(&info.foreign_toplevel)
+            })
+            .map(|(info, _)| info.foreign_toplevel.clone())
+            .collect();
+        for handle in wanted {
+            if tx.send(WaylandRequest::Screencopy(handle.clone())).is_ok() {
+                self.capturing.push(handle);
             }
         }
     }
@@ -1147,6 +1172,7 @@ impl cosmic::Application for Taskbar {
             config,
             locales: get_languages_from_env(),
             preview_on_start: std::env::var("COSMIC_TASKBAR_PREVIEW").ok(),
+            preview_test: std::env::var_os("COSMIC_TASKBAR_PREVIEW").is_some(),
             ..Default::default()
         };
 
@@ -1155,11 +1181,19 @@ impl cosmic::Application for Taskbar {
 
         app_list.item_ctr = app_list.pinned_list.len() as u32;
 
+        let preview_on_start = if app_list.preview_on_start.is_some() {
+            after(Duration::from_secs(2), Message::PreviewOnStart)
+        } else {
+            Task::none()
+        };
         (
             app_list,
-            Task::perform(try_get_gpus(), |gpus| {
-                cosmic::Action::App(Message::GpuRequest(gpus))
-            }),
+            Task::batch([
+                preview_on_start,
+                Task::perform(try_get_gpus(), |gpus| {
+                    cosmic::Action::App(Message::GpuRequest(gpus))
+                }),
+            ]),
         )
     }
 
@@ -1286,6 +1320,7 @@ impl cosmic::Application for Taskbar {
                     return after(HOVER_CLOSE, Message::HoverSettled(self.hover_gen));
                 }
             }
+            Message::PreviewOnStart => return self.preview_on_start(),
             Message::PointerLeft(id) => {
                 // Out of a surface fast, past its edge, its widgets may keep
                 // the pointer's last place inside them and never see it
@@ -1583,7 +1618,11 @@ impl cosmic::Application for Taskbar {
                     WaylandUpdate::Init(tx) => {
                         self.wayland_sender.replace(tx);
                     }
+                    WaylandUpdate::ImageFailed(handle) => {
+                        self.capturing.retain(|h| h != &handle);
+                    }
                     WaylandUpdate::Image(handle, img) => {
+                        self.capturing.retain(|h| h != &handle);
                         'img_update: for x in self
                             .active_list
                             .iter_mut()
@@ -1649,9 +1688,9 @@ impl cosmic::Application for Taskbar {
                                     desktop_info: new_desktop_info,
                                 });
                             }
-                            return self.preview_on_start();
                         }
                         ToplevelUpdate::Remove(handle) => {
+                            self.capturing.retain(|h| h != &handle);
                             for t in self
                                 .active_list
                                 .iter_mut()
@@ -1694,6 +1733,7 @@ impl cosmic::Application for Taskbar {
                             if info.state.contains(&State::Activated)
                                 && !was_active
                                 && !self.preview_hovered
+                                && !self.preview_test
                                 && self.preview_of().is_some()
                             {
                                 closing = self.close_preview();
@@ -1829,7 +1869,6 @@ impl cosmic::Application for Taskbar {
             Message::Rectangle(u) => match u {
                 RectangleUpdate::Rectangle(r) => {
                     self.rectangles.insert(r.0, r.1);
-                    return self.preview_on_start();
                 }
                 RectangleUpdate::Init(tracker) => {
                     self.rectangle_tracker.replace(tracker);

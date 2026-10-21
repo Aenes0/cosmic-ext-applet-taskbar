@@ -110,6 +110,8 @@ pub enum WaylandUpdate {
         terminal: bool,
     },
     Image(ExtForeignToplevelHandleV1, WaylandImage),
+    /// A picture asked for that won't come.
+    ImageFailed(ExtForeignToplevelHandleV1),
 }
 
 #[derive(Clone, Debug)]
