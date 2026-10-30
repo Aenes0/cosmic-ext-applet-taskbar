@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod anim;
 mod app;
 mod config;
+mod fx;
 mod launcher_entry;
 mod texts;
 mod wayland_handler;

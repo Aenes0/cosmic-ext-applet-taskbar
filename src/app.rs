@@ -454,6 +454,9 @@ pub struct Taskbar {
     /// App ids that no `.desktop` file has, after reading them all again
     /// once: the next window of the same app doesn't read them again.
     unknown_app_ids: rustc_hash::FxHashSet<String>,
+    /// How far the open preview has faded in (0 to 1).
+    preview_fade: crate::anim::Spring,
+    preview_fade_last: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -504,6 +507,7 @@ pub enum Message {
     OpenFavorites,
     OpenActive,
     Surface(surface::Action<Message>),
+    PreviewFadeTick,
 }
 
 fn index_in_list(
@@ -562,8 +566,8 @@ async fn try_get_gpus() -> Option<Vec<Gpu>> {
     Some(gpus)
 }
 
-const TOPLEVEL_BUTTON_WIDTH: f32 = 224.0;
-const TOPLEVEL_BUTTON_HEIGHT: f32 = 164.0;
+const TOPLEVEL_BUTTON_WIDTH: f32 = 232.0;
+const TOPLEVEL_BUTTON_HEIGHT: f32 = 170.0;
 /// How long the pointer rests on a button before its windows show, and
 /// how long they stay after it leaves, so it can get to them.
 const HOVER_OPEN: Duration = Duration::from_millis(400);
@@ -573,6 +577,14 @@ const PREVIEW_REFRESH: Duration = Duration::from_millis(1000);
 
 /// A window, as Windows 11 previews it: the app's icon, the title and the
 /// close button on top, the window's picture under them.
+/// The picture's box inside a card; the picture fits it by its own shape.
+const PREVIEW_BOX_W: f32 = 208.0;
+const PREVIEW_BOX_H: f32 = 124.0;
+const PREVIEW_PICTURE_RADIUS: f32 = 12.0;
+static PREVIEW_AUTOSIZE_ID: std::sync::LazyLock<iced::id::Id> =
+    std::sync::LazyLock::new(|| iced::id::Id::new("taskbar-preview-autosize"));
+
+/// `t` (0 to 1) is how far the preview has faded in.
 fn toplevel_button<'a>(
     img: Option<&WaylandImage>,
     app_icon: icon::Handle,
@@ -580,64 +592,165 @@ fn toplevel_button<'a>(
     handle: ExtForeignToplevelHandleV1,
     is_focused: bool,
     is_hovered: bool,
+    t: f32,
 ) -> Element<'a, Message> {
     let title = if title.trim().is_empty() {
         texts().untitled.to_string()
     } else {
         title
     };
-    let close: Element<_> = if is_hovered {
-        button::custom(icon::from_name("window-close-symbolic").size(16))
-            .class(Button::Destructive)
-            .on_press(Message::CloseToplevel(handle.clone()))
-            .padding(4)
-            .into()
-    } else {
-        // Same size, so the title doesn't move.
-        horizontal_space().width(Length::Fixed(24.0)).into()
+    let fade = move |mut c: iced::Color| {
+        c.a *= t;
+        c
     };
-    let header = row![
-        icon::icon(app_icon.clone()).size(16),
-        text::body(title)
-            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
-            .width(Length::Fill),
-        close,
-    ]
-    .spacing(8)
-    .height(Length::Fixed(24.0))
-    .align_y(Alignment::Center);
+    let has_picture = img.is_some();
 
-    // A minimized window has no picture: its app's icon, big, instead.
+    // Fit the picture in its box by the window's own shape.
+    let (pw, ph) = match img {
+        Some(i) if i.width > 0 && i.height > 0 => {
+            let scale = (PREVIEW_BOX_W / i.width as f32).min(PREVIEW_BOX_H / i.height as f32);
+            (
+                (i.width as f32 * scale).round().max(1.0),
+                (i.height as f32 * scale).round().max(1.0),
+            )
+        }
+        _ => (PREVIEW_BOX_W, PREVIEW_BOX_H),
+    };
     let picture: Element<_> = match img {
         Some(img) => Image::new(img.handle.clone())
-            .content_fit(iced::ContentFit::Contain)
+            .width(Length::Fixed(pw - 2.0))
+            .height(Length::Fixed(ph - 2.0))
+            .content_fit(iced::ContentFit::Fill)
+            .border_radius(PREVIEW_PICTURE_RADIUS - 1.0)
+            .opacity(t)
             .into(),
-        None => icon::icon(app_icon).size(48).into(),
+        // A minimized window has no picture: its app's icon, big, instead.
+        None => icon::icon(app_icon.clone()).size(48).into(),
     };
-    let picture = container(picture)
-        .center(Length::Fill)
-        .class(Container::custom(move |theme| container::Style {
-            border: Border {
-                radius: theme.cosmic().radius_s().into(),
+    let frame = container(picture)
+        .center(Length::Fixed(pw))
+        .height(Length::Fixed(ph))
+        .class(Container::custom(move |theme| {
+            let cosmic = theme.cosmic();
+            container::Style {
+                background: (!has_picture).then(|| {
+                    Background::Color(fade(iced::Color {
+                        a: 0.08,
+                        ..cosmic.on_bg_color().into()
+                    }))
+                }),
+                border: if is_focused {
+                    Border {
+                        radius: PREVIEW_PICTURE_RADIUS.into(),
+                        width: 2.0,
+                        color: fade(cosmic.accent_color().into()),
+                    }
+                } else if is_hovered {
+                    Border {
+                        radius: PREVIEW_PICTURE_RADIUS.into(),
+                        width: 2.0,
+                        color: fade(iced::Color {
+                            a: 0.6,
+                            ..cosmic.on_bg_color().into()
+                        }),
+                    }
+                } else {
+                    Border {
+                        radius: PREVIEW_PICTURE_RADIUS.into(),
+                        width: 1.0,
+                        color: fade(iced::Color {
+                            a: 0.18,
+                            ..cosmic.on_bg_color().into()
+                        }),
+                    }
+                },
+                shadow: iced::Shadow {
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35 * t),
+                    offset: iced::Vector::new(0.0, 4.0),
+                    blur_radius: 14.0,
+                },
                 ..Default::default()
-            },
-            ..Default::default()
+            }
         }));
 
-    column![header, picture]
-        .spacing(6)
+    // As on macOS: a round close button in the picture's corner, only
+    // while the pointer is on the card.
+    let close: Element<_> = if is_hovered {
+        container(
+            button::custom(icon::from_name("window-close-symbolic").size(12))
+                .class(Button::Destructive)
+                .on_press(Message::CloseToplevel(handle.clone()))
+                .padding(4),
+        )
+        .padding(6)
+        .into()
+    } else {
+        horizontal_space().width(Length::Shrink).into()
+    };
+    let thumb = container(iced::widget::stack![frame, close])
+        .width(Length::Fixed(PREVIEW_BOX_W))
+        .height(Length::Fixed(PREVIEW_BOX_H))
+        .center_x(Length::Fixed(PREVIEW_BOX_W))
+        .center_y(Length::Fixed(PREVIEW_BOX_H));
+
+    let title_color = fade(theme::active().cosmic().on_bg_color().into());
+    let caption = row![
+        // The little icon has no alpha: it shows once the card is mostly in.
+        if t > 0.6 {
+            Element::from(icon::icon(app_icon).size(16))
+        } else {
+            horizontal_space().width(Length::Fixed(16.0)).into()
+        },
+        text::body(title)
+            .class(theme::Text::Color(title_color))
+            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
+            .width(Length::Shrink),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let caption = container(caption)
+        .center_x(Length::Fill)
+        .height(Length::Fixed(22.0));
+
+    column![thumb, caption]
+        .spacing(8)
         .apply(button::custom)
         .on_press(Message::Toggle(handle.clone()))
-        .class(window_menu_style(is_focused))
+        .class(preview_card_style())
         .width(Length::Fixed(TOPLEVEL_BUTTON_WIDTH))
         .height(Length::Fixed(TOPLEVEL_BUTTON_HEIGHT))
-        .padding([4, 4, 8, 8])
+        .padding([8, 8, 8, 8])
         .selected(is_focused)
         .apply(mouse_area)
         .on_enter(Message::ToplevelHoverChanged(handle.clone(), true))
         .on_middle_press(Message::CloseToplevel(handle.clone()))
         .on_exit(Message::ToplevelHoverChanged(handle, false))
         .apply(Element::from)
+}
+
+/// A preview card has no button face: the picture's ring says which
+/// window is in front or under the pointer, as on macOS.
+fn preview_card_style() -> cosmic::theme::Button {
+    let flat = |theme: &cosmic::Theme, base: button::Style| button::Style {
+        background: None,
+        border_radius: theme.cosmic().radius_m().into(),
+        outline_width: 0.0,
+        ..base
+    };
+    Button::Custom {
+        active: Box::new(move |focused, theme| {
+            flat(theme, button::Catalog::active(theme, focused, false, &Button::AppletMenu))
+        }),
+        hovered: Box::new(move |focused, theme| {
+            flat(theme, button::Catalog::hovered(theme, focused, false, &Button::AppletMenu))
+        }),
+        disabled: Box::new(move |theme| {
+            flat(theme, button::Catalog::disabled(theme, &Button::AppletMenu))
+        }),
+        pressed: Box::new(move |focused, theme| {
+            flat(theme, button::Catalog::pressed(theme, focused, false, &Button::AppletMenu))
+        }),
+    }
 }
 
 fn window_menu_style(selected: bool) -> cosmic::theme::Button {
@@ -1019,11 +1132,15 @@ impl Taskbar {
             return Task::none();
         };
         let Some(rectangle) = self.rectangles.get(&id.into()).copied() else {
+            tracing::info!("DIAG open_preview id={id}: no rectangle");
             return Task::none();
         };
+        tracing::info!("DIAG open_preview id={id} parent={parent:?} rect={rectangle:?}");
         self.capture_windows(id);
         let new_id = window::Id::unique();
         self.preview_hovered = false;
+        self.preview_fade = crate::anim::Spring::new(if crate::anim::motion_scale() > 0.0 { 0.0 } else { 1.0 });
+        self.preview_fade_last = None;
         self.popup = Some(Popup {
             parent,
             id: new_id,
@@ -1144,6 +1261,19 @@ impl Taskbar {
             .into()
     }
 
+    /// Whether this window is the active one on whichever monitor it is on:
+    /// a click on its button from another monitor's bar then minimizes it
+    /// (`is_focused` only counts windows on this bar's own monitor).
+    fn is_activated(&self, handle: &ExtForeignToplevelHandleV1) -> bool {
+        self.active_list
+            .iter()
+            .chain(self.pinned_list.iter())
+            .flat_map(|i| i.toplevels.iter())
+            .any(|(info, _)| {
+                info.foreign_toplevel == *handle && info.state.contains(&State::Activated)
+            })
+    }
+
     // Check if a specific toplevel is focused
     fn is_focused(&self, handle: &ExtForeignToplevelHandleV1) -> bool {
         self.currently_active_toplevel().contains(handle)
@@ -1206,6 +1336,709 @@ impl cosmic::Application for Taskbar {
     }
 
     fn update(&mut self, message: Self::Message) -> app::Task<Self::Message> {
+        self.update_main(message)
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let focused_item = self.currently_active_toplevel();
+        let app_icon = AppletIconData::new(&self.core.applet);
+        let is_horizontal = match self.core.applet.anchor {
+            PanelAnchor::Top | PanelAnchor::Bottom => true,
+            PanelAnchor::Left | PanelAnchor::Right => false,
+        };
+        let (favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
+        let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
+            if cutoff < self.pinned_list.len() {
+                self.pinned_list.len() - cutoff + 1
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let favorites: Vec<_> = self
+            .pinned_list
+            .iter()
+            .rev()
+            .filter(|f| {
+                if favorite_to_remove > 0 && f.toplevels.is_empty() {
+                    favorite_to_remove -= 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        let main_window = self.core.main_window_id().unwrap();
+        let interaction_enabled = !self.menu_open();
+        let mut favorites: Vec<_> = favorites[favorite_to_remove..]
+            .iter()
+            .rev()
+            .map(|dock_item| {
+                self.item_button(
+                    dock_item,
+                    main_window,
+                    &focused_item,
+                    true,
+                    interaction_enabled,
+                )
+            })
+            .collect();
+
+        if favorite_popup_cutoff.is_some() {
+            // button to show more favorites
+            let icon = match self.core.applet.anchor {
+                PanelAnchor::Bottom => "go-up-symbolic",
+                PanelAnchor::Left => "go-next-symbolic",
+                PanelAnchor::Right => "go-previous-symbolic",
+                PanelAnchor::Top => "go-down-symbolic",
+            };
+            let btn = self
+                .core
+                .applet
+                .icon_button(icon)
+                .on_press(Message::OpenFavorites);
+            let btn: Element<_> = if let Some(rectangle_tracker) = self.rectangle_tracker.as_ref() {
+                rectangle_tracker
+                    .container(DockItemId::FavoritesOverflow, btn)
+                    .into()
+            } else {
+                btn.into()
+            };
+            favorites.push(btn);
+        }
+
+        if let Some((item, index)) = self
+            .dnd_offer
+            .as_ref()
+            .and_then(|o| o.dock_item.as_ref().map(|item| (item, o.preview_index)))
+        {
+            favorites.insert(
+                index.min(favorites.len()),
+                self.item_button(item, main_window, &focused_item, false, false),
+            );
+        } else if self.is_listening_for_dnd && self.pinned_list.is_empty() {
+            // show star indicating pinned_list is drag target
+            favorites.push(
+                container(
+                    icon::from_name("starred-symbolic.symbolic")
+                        .size(self.core.applet.suggested_size(false).0),
+                )
+                .padding(self.core.applet.suggested_padding(false).1) // TODO
+                .into(),
+            );
+        }
+
+        let filtered_active_list: Vec<_> = self
+            .active_list
+            .iter()
+            .filter(|dock_item| {
+                dock_item.toplevels.iter().any(|(toplevel_info, _)| {
+                    self.is_on_current_monitor_and_workspace(toplevel_info)
+                })
+            })
+            .collect();
+
+        let mut active: Vec<_> =
+            filtered_active_list[..active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
+                if n < filtered_active_list.len() {
+                    n.saturating_sub(1)
+                } else {
+                    n
+                }
+            })]
+                .iter()
+                .map(|dock_item| {
+                    self.item_button(
+                        dock_item,
+                        main_window,
+                        &focused_item,
+                        true,
+                        interaction_enabled,
+                    )
+                })
+                .collect();
+
+        if active_popup_cutoff.is_some_and(|n| n < filtered_active_list.len()) {
+            // button to show more active
+            let icon = match self.core.applet.anchor {
+                PanelAnchor::Bottom => "go-up-symbolic",
+                PanelAnchor::Left => "go-next-symbolic",
+                PanelAnchor::Right => "go-previous-symbolic",
+                PanelAnchor::Top => "go-down-symbolic",
+            };
+            let btn = self
+                .core
+                .applet
+                .icon_button(icon)
+                .on_press(Message::OpenActive);
+            let btn: Element<_> = if let Some(rectangle_tracker) = self.rectangle_tracker.as_ref() {
+                rectangle_tracker
+                    .container(DockItemId::ActiveOverflow, btn)
+                    .into()
+            } else {
+                btn.into()
+            };
+            active.push(btn);
+        }
+
+        let window_size = self.core.applet.suggested_bounds.as_ref();
+        let max_num = if self.core.applet.is_horizontal() {
+            let suggested_width = self.core.applet.suggested_size(false).0
+                + self.core.applet.suggested_padding(false).0 * 2;
+            window_size
+                .map(|w| w.width)
+                .map_or(u32::MAX, |b| (b / suggested_width as f32) as u32) as usize
+        } else {
+            let suggested_height = self.core.applet.suggested_size(false).1
+                + self.core.applet.suggested_padding(false).0 * 2;
+            window_size
+                .map(|w| w.height)
+                .map_or(u32::MAX, |b| (b / suggested_height as f32) as u32) as usize
+        }
+        .max(4);
+        if max_num < favorites.len() + active.len() {
+            let active_leftover = max_num.saturating_sub(favorites.len());
+            favorites.truncate(max_num - active_leftover);
+            active.truncate(active_leftover);
+        }
+        let (w, h, favorites, active) = if is_horizontal {
+            (
+                Length::Shrink,
+                Length::Shrink,
+                DndDestination::for_data::<DndPathBuf>(
+                    row(favorites).spacing(app_icon.icon_spacing),
+                    |_, _| Message::DndDropFinished,
+                )
+                .drag_id(DND_FAVORITES),
+                row(active).spacing(app_icon.icon_spacing).into(),
+            )
+        } else {
+            (
+                Length::Shrink,
+                Length::Shrink,
+                DndDestination::for_data(
+                    column(favorites).spacing(app_icon.icon_spacing),
+                    |_data: Option<DndPathBuf>, _| Message::DndDropFinished,
+                )
+                .drag_id(DND_FAVORITES),
+                column(active).spacing(app_icon.icon_spacing).into(),
+            )
+        };
+
+        let favorites = favorites
+            .on_enter(|x, y, _| Message::DndEnter(x, y))
+            .on_motion(Message::DndMotion)
+            .on_leave(|| Message::DndLeave);
+
+        let show_pinned =
+            !self.pinned_list.is_empty() || self.dnd_offer.is_some() || self.is_listening_for_dnd;
+        // One row, as on Windows: the pinned apps, then the others open.
+        let content_list: Vec<Element<_>> = if show_pinned && !self.active_list.is_empty() {
+            vec![favorites.into(), active]
+        } else if show_pinned {
+            vec![favorites.into()]
+        } else if !self.active_list.is_empty() {
+            vec![active]
+        } else {
+            vec![
+                icon::from_name("com.system76.CosmicAppList")
+                    .size(self.core.applet.suggested_size(false).0)
+                    .into(),
+            ]
+        };
+
+        let mut content = match &self.core.applet.anchor {
+            PanelAnchor::Left | PanelAnchor::Right => container(
+                Column::with_children(content_list)
+                    .spacing(app_icon.icon_spacing)
+                    .align_x(Alignment::Center)
+                    .height(h)
+                    .width(w),
+            ),
+            PanelAnchor::Top | PanelAnchor::Bottom => container(
+                Row::with_children(content_list)
+                    .spacing(app_icon.icon_spacing)
+                    .align_y(Alignment::Center)
+                    .height(h)
+                    .width(w),
+            ),
+        };
+        if self.active_list.is_empty() && self.pinned_list.is_empty() {
+            let suggested_size = self.core.applet.suggested_size(false);
+            content = content.width(suggested_size.0).height(suggested_size.1);
+        }
+
+        let mut limits = Limits::NONE.min_width(1.).min_height(1.);
+
+        if let Some(b) = self.core.applet.suggested_bounds {
+            if b.width as i32 > 0 {
+                limits = limits.max_width(b.width);
+            }
+            if b.height as i32 > 0 {
+                limits = limits.max_height(b.height);
+            }
+        }
+
+        self.core
+            .applet
+            .autosize_window(content)
+            .limits(limits)
+            .into()
+    }
+
+    fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+
+        if let Some((_, item, _, _)) = self.dnd_source.as_ref().filter(|s| s.0 == id) {
+            cosmic::widget::icon(
+                fde::IconSource::from_unknown(item.desktop_info.icon().unwrap_or_default())
+                    .as_cosmic_icon(),
+            )
+            .size(self.core.applet.suggested_size(false).0)
+            .into()
+        } else if let Some(Popup {
+            dock_item: DockItem { id, .. },
+            popup_type,
+            ..
+        }) = self.popup.as_ref().filter(|p| id == p.id)
+        {
+            let (dock_item, is_pinned) = match self.pinned_list.iter().find(|i| i.id == *id) {
+                Some(e) => (e, true),
+                None => match self.active_list.iter().find(|i| i.id == *id) {
+                    Some(e) => (e, false),
+                    None => return text::body("").into(),
+                },
+            };
+
+            // Filter toplevels to only show windows on current monitor and workspace
+            let filtered_toplevels: Vec<_> = dock_item
+                .toplevels
+                .iter()
+                .filter(|(toplevel_info, _)| {
+                    self.is_on_current_monitor_and_workspace(toplevel_info)
+                })
+                .collect();
+
+            let toplevels = &filtered_toplevels;
+            let desktop_info = &dock_item.desktop_info;
+
+            match popup_type {
+                PopupType::RightClickMenu => {
+                    // The jump list, in Windows' order: the app's own tasks,
+                    // the app (a new window of it), pin, close.
+                    fn menu_button<'a, Message: Clone + 'a>(
+                        content: impl Into<Element<'a, Message>>,
+                    ) -> cosmic::widget::Button<'a, Message> {
+                        button::custom(content)
+                            .height(20 + 2 * theme::spacing().space_xxs)
+                            .class(Button::MenuItem)
+                            .padding(menu_control_padding())
+                            .width(Length::Fill)
+                    }
+                    fn with_icon<'a, Message: 'a>(
+                        icon: Option<icon::Handle>,
+                        label: impl Into<Cow<'a, str>>,
+                    ) -> Element<'a, Message> {
+                        let label = text::body(label.into())
+                            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
+                        match icon {
+                            Some(icon) => row![icon::icon(icon).size(16), label]
+                                .spacing(8)
+                                .align_y(Alignment::Center)
+                                .into(),
+                            None => row![horizontal_space().width(Length::Fixed(16.0)), label]
+                                .spacing(8)
+                                .align_y(Alignment::Center)
+                                .into(),
+                        }
+                    }
+                    let t = texts();
+                    let app_icon = fde::IconSource::from_unknown(
+                        desktop_info.icon().unwrap_or_default(),
+                    )
+                    .as_cosmic_icon();
+                    let app_name = desktop_info
+                        .full_name(&self.locales)
+                        .unwrap_or_default()
+                        .into_owned();
+
+                    let mut content =
+                        menu::menu_column::MenuColumn::with_capacity(6).align_x(Alignment::Center);
+
+                    let mut tasks = 0;
+                    for action in desktop_info.actions().into_iter().flatten() {
+                        let Some(exec) = desktop_info.action_entry(action, "Exec") else {
+                            continue;
+                        };
+                        let Some(name) =
+                            desktop_info.action_entry_localized(action, "Name", &self.locales)
+                        else {
+                            continue;
+                        };
+                        let action_icon = desktop_info
+                            .action_entry(action, "Icon")
+                            .map(|i| fde::IconSource::from_unknown(i).as_cosmic_icon());
+                        content = content.push(menu_button(with_icon(action_icon, name)).on_press(
+                            Message::Exec(exec.into(), None, desktop_info.terminal()),
+                        ));
+                        tasks += 1;
+                    }
+                    if tasks > 0 {
+                        content = content.push(divider::horizontal::light());
+                    }
+
+                    if let Some(exec) = desktop_info.exec() {
+                        match self.gpus.as_ref().filter(|_| toplevels.is_empty()) {
+                            Some(gpus) => {
+                                let default_idx = preferred_gpu_idx(desktop_info, gpus.iter());
+                                for (i, gpu) in gpus.iter().enumerate() {
+                                    let mut label = t.run_on.replace("{}", &gpu.name);
+                                    if i == default_idx {
+                                        label = format!("{label} {}", t.default_gpu);
+                                    }
+                                    content = content.push(
+                                        menu_button(with_icon(Some(app_icon.clone()), label))
+                                            .on_press(Message::Exec(
+                                                exec.to_string(),
+                                                Some(i),
+                                                desktop_info.terminal(),
+                                            )),
+                                    );
+                                }
+                            }
+                            None => {
+                                content = content.push(
+                                    menu_button(with_icon(Some(app_icon.clone()), app_name))
+                                        .on_press(Message::Exec(
+                                            exec.to_string(),
+                                            None,
+                                            desktop_info.terminal(),
+                                        )),
+                                );
+                            }
+                        }
+                    }
+
+                    content = content.push(
+                        menu_button(with_icon(
+                            Some(from_name("view-pin-symbolic").into()),
+                            if is_pinned { t.unpin } else { t.pin },
+                        ))
+                        .on_press(if is_pinned {
+                            Message::UnpinApp(*id)
+                        } else {
+                            Message::PinApp(*id)
+                        }),
+                    );
+
+                    if !toplevels.is_empty() {
+                        content = content.push(
+                            menu_button(with_icon(
+                                Some(from_name("window-close-symbolic").into()),
+                                if toplevels.len() == 1 {
+                                    t.close_window
+                                } else {
+                                    t.close_all
+                                },
+                            ))
+                            .on_press(Message::Quit(desktop_info.id().to_string())),
+                        );
+                    }
+                    self.core
+                        .applet
+                        .popup_container(
+                            container(content)
+                                .padding(1)
+                                .height(Length::Shrink)
+                                .width(Length::Fill),
+                        )
+                        .limits(
+                            Limits::NONE
+                                .min_width(1.)
+                                .min_height(1.)
+                                .max_width(300.)
+                                .max_height(1000.),
+                        )
+                        .into()
+                }
+                PopupType::Preview => {
+                    let app_icon = fde::IconSource::from_unknown(
+                        desktop_info.icon().unwrap_or_default(),
+                    )
+                    .as_cosmic_icon();
+                    let cards = toplevels.iter().map(|(info, img)| {
+                        toplevel_button(
+                            img.as_ref(),
+                            app_icon.clone(),
+                            info.title.clone(),
+                            info.foreign_toplevel.clone(),
+                            self.is_focused(&info.foreign_toplevel),
+                            self.is_hovered(&info.foreign_toplevel),
+                            self.preview_fade.pos.clamp(0.0, 1.0),
+                        )
+                    });
+                    let content: Element<_> = if self.core.applet.is_horizontal() {
+                        Row::with_children(cards)
+                            .padding(12)
+                            .spacing(6)
+                            .align_y(Alignment::Center)
+                            .into()
+                    } else {
+                        Column::with_children(cards)
+                            .padding(8)
+                            .spacing(8)
+                            .align_x(Alignment::Center)
+                            .into()
+                    };
+                    let (vertical, horizontal) = match self.core.applet.anchor {
+                        PanelAnchor::Left => (iced::alignment::Vertical::Center, iced::alignment::Horizontal::Left),
+                        PanelAnchor::Right => (iced::alignment::Vertical::Center, iced::alignment::Horizontal::Right),
+                        PanelAnchor::Top => (iced::alignment::Vertical::Top, iced::alignment::Horizontal::Center),
+                        PanelAnchor::Bottom => (iced::alignment::Vertical::Bottom, iced::alignment::Horizontal::Center),
+                    };
+                    let fade = self.preview_fade.pos.clamp(0.0, 1.0);
+                    let glass = container(content).class(Container::custom(move |theme| {
+                        let cosmic = theme.cosmic();
+                        let mut base: iced::Color = cosmic.background(theme.transparent).base.into();
+                        base.a = 0.78 * fade.max(0.35);
+                        container::Style {
+                            background: Some(Background::Color(base)),
+                            border: Border {
+                                radius: 22.0.into(),
+                                width: 1.0,
+                                color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.16),
+                            },
+                            shadow: iced::Shadow {
+                                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                                offset: iced::Vector::new(0.0, 8.0),
+                                blur_radius: 24.0,
+                            },
+                            ..Default::default()
+                        }
+                    }));
+                    mouse_area(
+                        cosmic::widget::autosize::autosize(
+                            container(glass)
+                                .height(Length::Shrink)
+                                .align_x(horizontal)
+                                .align_y(vertical),
+                            PREVIEW_AUTOSIZE_ID.clone(),
+                        )
+                        .limits(Limits::NONE.min_width(1.).min_height(1.).max_height(1200.)),
+                    )
+                    .on_enter(Message::PreviewHover(true))
+                    .on_exit(Message::PreviewHover(false))
+                    .into()
+                }
+            }
+        } else if self
+            .overflow_active_popup
+            .as_ref()
+            .is_some_and(|overflow_id| overflow_id == &id)
+        {
+            let (_favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
+
+            let focused_item = self.currently_active_toplevel();
+
+            let filtered_active_list: Vec<_> = self
+                .active_list
+                .iter()
+                .filter(|dock_item| {
+                    dock_item.toplevels.iter().any(|(toplevel_info, _)| {
+                        self.is_on_current_monitor_and_workspace(toplevel_info)
+                    })
+                })
+                .collect();
+
+            let active: Vec<_> = filtered_active_list
+                .iter()
+                .rev()
+                .take(active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
+                    if n < filtered_active_list.len() {
+                        filtered_active_list.len() - n + 1
+                    } else {
+                        0
+                    }
+                }))
+                .map(|dock_item| {
+                    self.item_button(dock_item, id, &focused_item, true, !self.menu_open())
+                })
+                .collect();
+            let content = match &self.core.applet.anchor {
+                PanelAnchor::Left | PanelAnchor::Right => container(
+                    Column::with_children(active)
+                        .spacing(4.0)
+                        .align_x(Alignment::Center)
+                        .width(Length::Shrink)
+                        .height(Length::Shrink),
+                ),
+                PanelAnchor::Top | PanelAnchor::Bottom => container(
+                    Row::with_children(active)
+                        .spacing(4.0)
+                        .align_y(Alignment::Center)
+                        .width(Length::Shrink)
+                        .height(Length::Shrink),
+                ),
+            };
+            // send clear popup on press content if there is an active popup
+            let content: Element<_> = if self.popup.is_some() {
+                mouse_area(content)
+                    .on_release(Message::ClosePopup)
+                    .on_right_release(Message::ClosePopup)
+                    .into()
+            } else {
+                content.into()
+            };
+            self.core
+                .applet
+                .popup_container(content)
+                .limits(
+                    Limits::NONE
+                        .min_width(1.)
+                        .min_height(1.)
+                        .max_width(1920.)
+                        .max_height(1000.),
+                )
+                .into()
+        } else if self
+            .overflow_favorites_popup
+            .as_ref()
+            .is_some_and(|popup_id| popup_id == &id)
+        {
+            let (favorite_popup_cutoff, _active_popup_cutoff) = self.panel_overflow_lengths();
+
+            let focused_item = self.currently_active_toplevel();
+            // show the overflow popup for favorites list
+
+            let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
+                if cutoff < self.pinned_list.len() {
+                    self.pinned_list.len() - cutoff + 1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let mut favorites_extra = Vec::with_capacity(favorite_to_remove);
+            let mut favorites: Vec<_> = self
+                .pinned_list
+                .iter()
+                .rev()
+                .filter(|f| {
+                    if favorite_to_remove > 0 && f.toplevels.is_empty() {
+                        favorite_to_remove -= 1;
+                        true
+                    } else {
+                        favorites_extra.push(*f);
+                        false
+                    }
+                })
+                .collect();
+            favorites.extend(favorites_extra[..favorite_to_remove].iter().copied());
+            let favorites: Vec<_> = favorites
+                .iter()
+                .rev()
+                .map(|dock_item| {
+                    self.item_button(dock_item, id, &focused_item, true, !self.menu_open())
+                })
+                .collect();
+            let content = match &self.core.applet.anchor {
+                PanelAnchor::Left | PanelAnchor::Right => container(
+                    Column::with_children(favorites)
+                        .spacing(4.0)
+                        .align_x(Alignment::Center)
+                        .width(Length::Shrink)
+                        .height(Length::Shrink),
+                ),
+                PanelAnchor::Top | PanelAnchor::Bottom => container(
+                    Row::with_children(favorites)
+                        .spacing(4.0)
+                        .align_y(Alignment::Center)
+                        .width(Length::Shrink)
+                        .height(Length::Shrink),
+                ),
+            };
+            let content: Element<_> = if self.popup.is_some() {
+                mouse_area(content)
+                    .on_right_release(Message::ClosePopup)
+                    .on_press(Message::ClosePopup)
+                    .into()
+            } else {
+                content.into()
+            };
+            self.core
+                .applet
+                .popup_container(content)
+                .limits(
+                    Limits::NONE
+                        .min_width(1.)
+                        .min_height(1.)
+                        .max_width(1920.)
+                        .max_height(1000.),
+                )
+                .into()
+        } else {
+            let suggested = self.core.applet.suggested_size(false);
+            iced::widget::row!()
+                .width(Length::Fixed(suggested.0 as f32))
+                .height(Length::Fixed(suggested.1 as f32))
+                .into()
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        // The previews' pictures follow the windows while they show.
+        let refresh = if self.preview_of().is_some() {
+            iced::time::every(PREVIEW_REFRESH).map(|_| Message::RefreshPreview)
+        } else {
+            Subscription::none()
+        };
+        let fade = if self.preview_of().is_some() && !self.preview_fade.settled(1.0) {
+            iced::time::every(Duration::from_millis(8)).map(|_| Message::PreviewFadeTick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([
+            refresh,
+            fade,
+            launcher_entry::subscription().map(Message::Badge),
+            wayland_subscription().map(Message::Wayland),
+            listen_with(|e, _, id| match e {
+                cosmic::iced::core::Event::PlatformSpecific(event::PlatformSpecific::Wayland(
+                    event::wayland::Event::Seat(e, seat),
+                )) => match e {
+                    event::wayland::SeatEvent::Enter => Some(Message::NewSeat(seat)),
+                    event::wayland::SeatEvent::Leave => Some(Message::RemovedSeat),
+                },
+                cosmic::iced::core::Event::Mouse(
+                    cosmic::iced::core::mouse::Event::ButtonPressed(_),
+                ) => Some(Message::Pressed(id)),
+                cosmic::iced::core::Event::Mouse(cosmic::iced::core::mouse::Event::CursorLeft) => {
+                    Some(Message::PointerLeft(id))
+                }
+                _ => None,
+            }),
+            rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
+            self.core.watch_config(LIST_ID).map(|u| {
+                for why in u.errors {
+                    tracing::error!(why = why.to_string(), "Error watching config");
+                }
+                Message::ConfigUpdated(u.config)
+            }),
+        ])
+    }
+
+    fn style(&self) -> Option<iced::theme::Style> {
+        Some(cosmic::applet::style())
+    }
+
+    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
+        Some(Message::CloseRequested(id))
+    }
+}
+
+impl Taskbar {
+    pub(crate) fn update_main(&mut self, message: Message) -> app::Task<Message> {
         match message {
             Message::Popup(id, parent_window_id) => {
                 let mut closing = Task::none();
@@ -1289,6 +2122,7 @@ impl cosmic::Application for Taskbar {
                 return Task::batch([close, self.open_preview(id, parent_window_id)]);
             }
             Message::IconHover(id, parent_window_id, entering) => {
+                tracing::info!("DIAG IconHover id={id} parent={parent_window_id:?} entering={entering} preview_of={:?} hover={:?} popup={:?}", self.preview_of(), self.hover, self.popup.as_ref().map(|p| (p.id, p.popup_type == PopupType::Preview)));
                 self.hover_gen += 1;
                 let hover_gen = self.hover_gen;
                 if entering {
@@ -1313,6 +2147,7 @@ impl cosmic::Application for Taskbar {
                 return after(HOVER_CLOSE, Message::HoverSettled(hover_gen));
             }
             Message::PreviewHover(entering) => {
+                tracing::info!("DIAG PreviewHover entering={entering}");
                 self.hover_gen += 1;
                 self.preview_hovered = entering;
                 if !entering {
@@ -1322,11 +2157,12 @@ impl cosmic::Application for Taskbar {
             }
             Message::PreviewOnStart => return self.preview_on_start(),
             Message::PointerLeft(id) => {
+                tracing::info!("DIAG PointerLeft id={id:?} hover={:?}", self.hover);
                 // Out of a surface fast, past its edge, its widgets may keep
                 // the pointer's last place inside them and never see it
                 // leave: the surface's own event says it.
                 if self.popup.as_ref().is_some_and(|p| p.id == id && p.popup_type == PopupType::Preview) {
-                    return self.update(Message::PreviewHover(false));
+                    return self.update_main(Message::PreviewHover(false));
                 }
                 if self.hover.is_some_and(|(_, parent)| parent == id) {
                     self.hover = None;
@@ -1335,6 +2171,7 @@ impl cosmic::Application for Taskbar {
                 }
             }
             Message::HoverSettled(hover_gen) => {
+                tracing::info!("DIAG HoverSettled gen={hover_gen} cur={} preview_hovered={} preview_of={:?} menu_open={} hover={:?} has_windows={:?}", self.hover_gen, self.preview_hovered, self.preview_of(), self.menu_open(), self.hover, self.hover.map(|(id, _)| self.has_windows(id)));
                 if hover_gen != self.hover_gen
                     || (self.preview_hovered && self.preview_of().is_some())
                 {
@@ -1352,6 +2189,15 @@ impl cosmic::Application for Taskbar {
                         }
                     }
                     _ => return self.close_preview(),
+                }
+            }
+            Message::PreviewFadeTick => {
+                let now = std::time::Instant::now();
+                let dt = self.preview_fade_last.map_or(0.0, |t| (now - t).as_secs_f32());
+                self.preview_fade_last = Some(now);
+                self.preview_fade.step(1.0, dt, 260.0, 26.0);
+                if self.preview_fade.settled(1.0) {
+                    self.preview_fade = crate::anim::Spring::new(1.0);
                 }
             }
             Message::RefreshPreview => {
@@ -1402,8 +2248,20 @@ impl cosmic::Application for Taskbar {
                 }
             }
             Message::Toggle(handle) => {
+                tracing::info!(
+                    "DIAG Toggle focused={} activated={} active_now={} states={:?}",
+                    self.is_focused(&handle),
+                    self.is_activated(&handle),
+                    self.currently_active_toplevel().len(),
+                    self.active_list
+                        .iter()
+                        .chain(self.pinned_list.iter())
+                        .flat_map(|i| i.toplevels.iter())
+                        .find(|(info, _)| info.foreign_toplevel == handle)
+                        .map(|(info, _)| info.state.clone())
+                );
                 if let Some(tx) = self.wayland_sender.as_ref() {
-                    let _ = tx.send(WaylandRequest::Toplevel(if self.is_focused(&handle) {
+                    let _ = tx.send(WaylandRequest::Toplevel(if self.is_activated(&handle) {
                         ToplevelRequest::Minimize(handle)
                     } else {
                         ToplevelRequest::Activate(handle)
@@ -1859,7 +2717,7 @@ impl cosmic::Application for Taskbar {
             Message::Exec(exec, gpu_idx, terminal) => {
                 if let Some(tx) = self.wayland_sender.as_ref() {
                     let _ = tx.send(WaylandRequest::TokenRequest {
-                        app_id: Self::APP_ID.to_string(),
+                        app_id: <Self as cosmic::Application>::APP_ID.to_string(),
                         exec,
                         gpu_idx,
                         terminal,
@@ -1925,6 +2783,7 @@ impl cosmic::Application for Taskbar {
                         .collect();
             }
             Message::CloseRequested(id) => {
+                tracing::info!("DIAG CloseRequested id={id:?}");
                 if Some(id) == self.popup.as_ref().map(|p| p.id) {
                     self.popup = None;
                 }
@@ -2085,666 +2944,6 @@ impl cosmic::Application for Taskbar {
         }
 
         Task::none()
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        let focused_item = self.currently_active_toplevel();
-        let app_icon = AppletIconData::new(&self.core.applet);
-        let is_horizontal = match self.core.applet.anchor {
-            PanelAnchor::Top | PanelAnchor::Bottom => true,
-            PanelAnchor::Left | PanelAnchor::Right => false,
-        };
-        let (favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
-        let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
-            if cutoff < self.pinned_list.len() {
-                self.pinned_list.len() - cutoff + 1
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let favorites: Vec<_> = self
-            .pinned_list
-            .iter()
-            .rev()
-            .filter(|f| {
-                if favorite_to_remove > 0 && f.toplevels.is_empty() {
-                    favorite_to_remove -= 1;
-                    false
-                } else {
-                    true
-                }
-            })
-            .collect();
-        let main_window = self.core.main_window_id().unwrap();
-        let interaction_enabled = !self.menu_open();
-        let mut favorites: Vec<_> = favorites[favorite_to_remove..]
-            .iter()
-            .rev()
-            .map(|dock_item| {
-                self.item_button(
-                    dock_item,
-                    main_window,
-                    &focused_item,
-                    true,
-                    interaction_enabled,
-                )
-            })
-            .collect();
-
-        if favorite_popup_cutoff.is_some() {
-            // button to show more favorites
-            let icon = match self.core.applet.anchor {
-                PanelAnchor::Bottom => "go-up-symbolic",
-                PanelAnchor::Left => "go-next-symbolic",
-                PanelAnchor::Right => "go-previous-symbolic",
-                PanelAnchor::Top => "go-down-symbolic",
-            };
-            let btn = self
-                .core
-                .applet
-                .icon_button(icon)
-                .on_press(Message::OpenFavorites);
-            let btn: Element<_> = if let Some(rectangle_tracker) = self.rectangle_tracker.as_ref() {
-                rectangle_tracker
-                    .container(DockItemId::FavoritesOverflow, btn)
-                    .into()
-            } else {
-                btn.into()
-            };
-            favorites.push(btn);
-        }
-
-        if let Some((item, index)) = self
-            .dnd_offer
-            .as_ref()
-            .and_then(|o| o.dock_item.as_ref().map(|item| (item, o.preview_index)))
-        {
-            favorites.insert(
-                index.min(favorites.len()),
-                self.item_button(item, main_window, &focused_item, false, false),
-            );
-        } else if self.is_listening_for_dnd && self.pinned_list.is_empty() {
-            // show star indicating pinned_list is drag target
-            favorites.push(
-                container(
-                    icon::from_name("starred-symbolic.symbolic")
-                        .size(self.core.applet.suggested_size(false).0),
-                )
-                .padding(self.core.applet.suggested_padding(false).1) // TODO
-                .into(),
-            );
-        }
-
-        let filtered_active_list: Vec<_> = self
-            .active_list
-            .iter()
-            .filter(|dock_item| {
-                dock_item.toplevels.iter().any(|(toplevel_info, _)| {
-                    self.is_on_current_monitor_and_workspace(toplevel_info)
-                })
-            })
-            .collect();
-
-        let mut active: Vec<_> =
-            filtered_active_list[..active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
-                if n < filtered_active_list.len() {
-                    n.saturating_sub(1)
-                } else {
-                    n
-                }
-            })]
-                .iter()
-                .map(|dock_item| {
-                    self.item_button(
-                        dock_item,
-                        main_window,
-                        &focused_item,
-                        true,
-                        interaction_enabled,
-                    )
-                })
-                .collect();
-
-        if active_popup_cutoff.is_some_and(|n| n < filtered_active_list.len()) {
-            // button to show more active
-            let icon = match self.core.applet.anchor {
-                PanelAnchor::Bottom => "go-up-symbolic",
-                PanelAnchor::Left => "go-next-symbolic",
-                PanelAnchor::Right => "go-previous-symbolic",
-                PanelAnchor::Top => "go-down-symbolic",
-            };
-            let btn = self
-                .core
-                .applet
-                .icon_button(icon)
-                .on_press(Message::OpenActive);
-            let btn: Element<_> = if let Some(rectangle_tracker) = self.rectangle_tracker.as_ref() {
-                rectangle_tracker
-                    .container(DockItemId::ActiveOverflow, btn)
-                    .into()
-            } else {
-                btn.into()
-            };
-            active.push(btn);
-        }
-
-        let window_size = self.core.applet.suggested_bounds.as_ref();
-        let max_num = if self.core.applet.is_horizontal() {
-            let suggested_width = self.core.applet.suggested_size(false).0
-                + self.core.applet.suggested_padding(false).0 * 2;
-            window_size
-                .map(|w| w.width)
-                .map_or(u32::MAX, |b| (b / suggested_width as f32) as u32) as usize
-        } else {
-            let suggested_height = self.core.applet.suggested_size(false).1
-                + self.core.applet.suggested_padding(false).0 * 2;
-            window_size
-                .map(|w| w.height)
-                .map_or(u32::MAX, |b| (b / suggested_height as f32) as u32) as usize
-        }
-        .max(4);
-        if max_num < favorites.len() + active.len() {
-            let active_leftover = max_num.saturating_sub(favorites.len());
-            favorites.truncate(max_num - active_leftover);
-            active.truncate(active_leftover);
-        }
-        let (w, h, favorites, active) = if is_horizontal {
-            (
-                Length::Shrink,
-                Length::Shrink,
-                DndDestination::for_data::<DndPathBuf>(
-                    row(favorites).spacing(app_icon.icon_spacing),
-                    |_, _| Message::DndDropFinished,
-                )
-                .drag_id(DND_FAVORITES),
-                row(active).spacing(app_icon.icon_spacing).into(),
-            )
-        } else {
-            (
-                Length::Shrink,
-                Length::Shrink,
-                DndDestination::for_data(
-                    column(favorites).spacing(app_icon.icon_spacing),
-                    |_data: Option<DndPathBuf>, _| Message::DndDropFinished,
-                )
-                .drag_id(DND_FAVORITES),
-                column(active).spacing(app_icon.icon_spacing).into(),
-            )
-        };
-
-        let favorites = favorites
-            .on_enter(|x, y, _| Message::DndEnter(x, y))
-            .on_motion(Message::DndMotion)
-            .on_leave(|| Message::DndLeave);
-
-        let show_pinned =
-            !self.pinned_list.is_empty() || self.dnd_offer.is_some() || self.is_listening_for_dnd;
-        // One row, as on Windows: the pinned apps, then the others open.
-        let content_list: Vec<Element<_>> = if show_pinned && !self.active_list.is_empty() {
-            vec![favorites.into(), active]
-        } else if show_pinned {
-            vec![favorites.into()]
-        } else if !self.active_list.is_empty() {
-            vec![active]
-        } else {
-            vec![
-                icon::from_name("com.system76.CosmicAppList")
-                    .size(self.core.applet.suggested_size(false).0)
-                    .into(),
-            ]
-        };
-
-        let mut content = match &self.core.applet.anchor {
-            PanelAnchor::Left | PanelAnchor::Right => container(
-                Column::with_children(content_list)
-                    .spacing(app_icon.icon_spacing)
-                    .align_x(Alignment::Center)
-                    .height(h)
-                    .width(w),
-            ),
-            PanelAnchor::Top | PanelAnchor::Bottom => container(
-                Row::with_children(content_list)
-                    .spacing(app_icon.icon_spacing)
-                    .align_y(Alignment::Center)
-                    .height(h)
-                    .width(w),
-            ),
-        };
-        if self.active_list.is_empty() && self.pinned_list.is_empty() {
-            let suggested_size = self.core.applet.suggested_size(false);
-            content = content.width(suggested_size.0).height(suggested_size.1);
-        }
-
-        let mut limits = Limits::NONE.min_width(1.).min_height(1.);
-
-        if let Some(b) = self.core.applet.suggested_bounds {
-            if b.width as i32 > 0 {
-                limits = limits.max_width(b.width);
-            }
-            if b.height as i32 > 0 {
-                limits = limits.max_height(b.height);
-            }
-        }
-
-        self.core
-            .applet
-            .autosize_window(content)
-            .limits(limits)
-            .into()
-    }
-
-    fn view_window(&self, id: window::Id) -> Element<'_, Message> {
-
-        if let Some((_, item, _, _)) = self.dnd_source.as_ref().filter(|s| s.0 == id) {
-            cosmic::widget::icon(
-                fde::IconSource::from_unknown(item.desktop_info.icon().unwrap_or_default())
-                    .as_cosmic_icon(),
-            )
-            .size(self.core.applet.suggested_size(false).0)
-            .into()
-        } else if let Some(Popup {
-            dock_item: DockItem { id, .. },
-            popup_type,
-            ..
-        }) = self.popup.as_ref().filter(|p| id == p.id)
-        {
-            let (dock_item, is_pinned) = match self.pinned_list.iter().find(|i| i.id == *id) {
-                Some(e) => (e, true),
-                None => match self.active_list.iter().find(|i| i.id == *id) {
-                    Some(e) => (e, false),
-                    None => return text::body("").into(),
-                },
-            };
-
-            // Filter toplevels to only show windows on current monitor and workspace
-            let filtered_toplevels: Vec<_> = dock_item
-                .toplevels
-                .iter()
-                .filter(|(toplevel_info, _)| {
-                    self.is_on_current_monitor_and_workspace(toplevel_info)
-                })
-                .collect();
-
-            let toplevels = &filtered_toplevels;
-            let desktop_info = &dock_item.desktop_info;
-
-            match popup_type {
-                PopupType::RightClickMenu => {
-                    // The jump list, in Windows' order: the app's own tasks,
-                    // the app (a new window of it), pin, close.
-                    fn menu_button<'a, Message: Clone + 'a>(
-                        content: impl Into<Element<'a, Message>>,
-                    ) -> cosmic::widget::Button<'a, Message> {
-                        button::custom(content)
-                            .height(20 + 2 * theme::spacing().space_xxs)
-                            .class(Button::MenuItem)
-                            .padding(menu_control_padding())
-                            .width(Length::Fill)
-                    }
-                    fn with_icon<'a, Message: 'a>(
-                        icon: Option<icon::Handle>,
-                        label: impl Into<Cow<'a, str>>,
-                    ) -> Element<'a, Message> {
-                        let label = text::body(label.into())
-                            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
-                        match icon {
-                            Some(icon) => row![icon::icon(icon).size(16), label]
-                                .spacing(8)
-                                .align_y(Alignment::Center)
-                                .into(),
-                            None => row![horizontal_space().width(Length::Fixed(16.0)), label]
-                                .spacing(8)
-                                .align_y(Alignment::Center)
-                                .into(),
-                        }
-                    }
-                    let t = texts();
-                    let app_icon = fde::IconSource::from_unknown(
-                        desktop_info.icon().unwrap_or_default(),
-                    )
-                    .as_cosmic_icon();
-                    let app_name = desktop_info
-                        .full_name(&self.locales)
-                        .unwrap_or_default()
-                        .into_owned();
-
-                    let mut content =
-                        menu::menu_column::MenuColumn::with_capacity(6).align_x(Alignment::Center);
-
-                    let mut tasks = 0;
-                    for action in desktop_info.actions().into_iter().flatten() {
-                        let Some(exec) = desktop_info.action_entry(action, "Exec") else {
-                            continue;
-                        };
-                        let Some(name) =
-                            desktop_info.action_entry_localized(action, "Name", &self.locales)
-                        else {
-                            continue;
-                        };
-                        let action_icon = desktop_info
-                            .action_entry(action, "Icon")
-                            .map(|i| fde::IconSource::from_unknown(i).as_cosmic_icon());
-                        content = content.push(menu_button(with_icon(action_icon, name)).on_press(
-                            Message::Exec(exec.into(), None, desktop_info.terminal()),
-                        ));
-                        tasks += 1;
-                    }
-                    if tasks > 0 {
-                        content = content.push(divider::horizontal::light());
-                    }
-
-                    if let Some(exec) = desktop_info.exec() {
-                        match self.gpus.as_ref().filter(|_| toplevels.is_empty()) {
-                            Some(gpus) => {
-                                let default_idx = preferred_gpu_idx(desktop_info, gpus.iter());
-                                for (i, gpu) in gpus.iter().enumerate() {
-                                    let mut label = t.run_on.replace("{}", &gpu.name);
-                                    if i == default_idx {
-                                        label = format!("{label} {}", t.default_gpu);
-                                    }
-                                    content = content.push(
-                                        menu_button(with_icon(Some(app_icon.clone()), label))
-                                            .on_press(Message::Exec(
-                                                exec.to_string(),
-                                                Some(i),
-                                                desktop_info.terminal(),
-                                            )),
-                                    );
-                                }
-                            }
-                            None => {
-                                content = content.push(
-                                    menu_button(with_icon(Some(app_icon.clone()), app_name))
-                                        .on_press(Message::Exec(
-                                            exec.to_string(),
-                                            None,
-                                            desktop_info.terminal(),
-                                        )),
-                                );
-                            }
-                        }
-                    }
-
-                    content = content.push(
-                        menu_button(with_icon(
-                            Some(from_name("view-pin-symbolic").into()),
-                            if is_pinned { t.unpin } else { t.pin },
-                        ))
-                        .on_press(if is_pinned {
-                            Message::UnpinApp(*id)
-                        } else {
-                            Message::PinApp(*id)
-                        }),
-                    );
-
-                    if !toplevels.is_empty() {
-                        content = content.push(
-                            menu_button(with_icon(
-                                Some(from_name("window-close-symbolic").into()),
-                                if toplevels.len() == 1 {
-                                    t.close_window
-                                } else {
-                                    t.close_all
-                                },
-                            ))
-                            .on_press(Message::Quit(desktop_info.id().to_string())),
-                        );
-                    }
-                    self.core
-                        .applet
-                        .popup_container(
-                            container(content)
-                                .padding(1)
-                                .height(Length::Shrink)
-                                .width(Length::Fill),
-                        )
-                        .limits(
-                            Limits::NONE
-                                .min_width(1.)
-                                .min_height(1.)
-                                .max_width(300.)
-                                .max_height(1000.),
-                        )
-                        .into()
-                }
-                PopupType::Preview => {
-                    let app_icon = fde::IconSource::from_unknown(
-                        desktop_info.icon().unwrap_or_default(),
-                    )
-                    .as_cosmic_icon();
-                    let cards = toplevels.iter().map(|(info, img)| {
-                        toplevel_button(
-                            img.as_ref(),
-                            app_icon.clone(),
-                            info.title.clone(),
-                            info.foreign_toplevel.clone(),
-                            self.is_focused(&info.foreign_toplevel),
-                            self.is_hovered(&info.foreign_toplevel),
-                        )
-                    });
-                    let content: Element<_> = if self.core.applet.is_horizontal() {
-                        Row::with_children(cards)
-                            .padding(8)
-                            .spacing(8)
-                            .align_y(Alignment::Center)
-                            .into()
-                    } else {
-                        Column::with_children(cards)
-                            .padding(8)
-                            .spacing(8)
-                            .align_x(Alignment::Center)
-                            .into()
-                    };
-                    mouse_area(
-                        self.core
-                            .applet
-                            .popup_container(content)
-                            .limits(Limits::NONE.min_width(1.).min_height(1.).max_height(1200.)),
-                    )
-                    .on_enter(Message::PreviewHover(true))
-                    .on_exit(Message::PreviewHover(false))
-                    .into()
-                }
-            }
-        } else if self
-            .overflow_active_popup
-            .as_ref()
-            .is_some_and(|overflow_id| overflow_id == &id)
-        {
-            let (_favorite_popup_cutoff, active_popup_cutoff) = self.panel_overflow_lengths();
-
-            let focused_item = self.currently_active_toplevel();
-
-            let filtered_active_list: Vec<_> = self
-                .active_list
-                .iter()
-                .filter(|dock_item| {
-                    dock_item.toplevels.iter().any(|(toplevel_info, _)| {
-                        self.is_on_current_monitor_and_workspace(toplevel_info)
-                    })
-                })
-                .collect();
-
-            let active: Vec<_> = filtered_active_list
-                .iter()
-                .rev()
-                .take(active_popup_cutoff.map_or(filtered_active_list.len(), |n| {
-                    if n < filtered_active_list.len() {
-                        filtered_active_list.len() - n + 1
-                    } else {
-                        0
-                    }
-                }))
-                .map(|dock_item| {
-                    self.item_button(dock_item, id, &focused_item, true, !self.menu_open())
-                })
-                .collect();
-            let content = match &self.core.applet.anchor {
-                PanelAnchor::Left | PanelAnchor::Right => container(
-                    Column::with_children(active)
-                        .spacing(4.0)
-                        .align_x(Alignment::Center)
-                        .width(Length::Shrink)
-                        .height(Length::Shrink),
-                ),
-                PanelAnchor::Top | PanelAnchor::Bottom => container(
-                    Row::with_children(active)
-                        .spacing(4.0)
-                        .align_y(Alignment::Center)
-                        .width(Length::Shrink)
-                        .height(Length::Shrink),
-                ),
-            };
-            // send clear popup on press content if there is an active popup
-            let content: Element<_> = if self.popup.is_some() {
-                mouse_area(content)
-                    .on_release(Message::ClosePopup)
-                    .on_right_release(Message::ClosePopup)
-                    .into()
-            } else {
-                content.into()
-            };
-            self.core
-                .applet
-                .popup_container(content)
-                .limits(
-                    Limits::NONE
-                        .min_width(1.)
-                        .min_height(1.)
-                        .max_width(1920.)
-                        .max_height(1000.),
-                )
-                .into()
-        } else if self
-            .overflow_favorites_popup
-            .as_ref()
-            .is_some_and(|popup_id| popup_id == &id)
-        {
-            let (favorite_popup_cutoff, _active_popup_cutoff) = self.panel_overflow_lengths();
-
-            let focused_item = self.currently_active_toplevel();
-            // show the overflow popup for favorites list
-
-            let mut favorite_to_remove = if let Some(cutoff) = favorite_popup_cutoff {
-                if cutoff < self.pinned_list.len() {
-                    self.pinned_list.len() - cutoff + 1
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            let mut favorites_extra = Vec::with_capacity(favorite_to_remove);
-            let mut favorites: Vec<_> = self
-                .pinned_list
-                .iter()
-                .rev()
-                .filter(|f| {
-                    if favorite_to_remove > 0 && f.toplevels.is_empty() {
-                        favorite_to_remove -= 1;
-                        true
-                    } else {
-                        favorites_extra.push(*f);
-                        false
-                    }
-                })
-                .collect();
-            favorites.extend(favorites_extra[..favorite_to_remove].iter().copied());
-            let favorites: Vec<_> = favorites
-                .iter()
-                .rev()
-                .map(|dock_item| {
-                    self.item_button(dock_item, id, &focused_item, true, !self.menu_open())
-                })
-                .collect();
-            let content = match &self.core.applet.anchor {
-                PanelAnchor::Left | PanelAnchor::Right => container(
-                    Column::with_children(favorites)
-                        .spacing(4.0)
-                        .align_x(Alignment::Center)
-                        .width(Length::Shrink)
-                        .height(Length::Shrink),
-                ),
-                PanelAnchor::Top | PanelAnchor::Bottom => container(
-                    Row::with_children(favorites)
-                        .spacing(4.0)
-                        .align_y(Alignment::Center)
-                        .width(Length::Shrink)
-                        .height(Length::Shrink),
-                ),
-            };
-            let content: Element<_> = if self.popup.is_some() {
-                mouse_area(content)
-                    .on_right_release(Message::ClosePopup)
-                    .on_press(Message::ClosePopup)
-                    .into()
-            } else {
-                content.into()
-            };
-            self.core
-                .applet
-                .popup_container(content)
-                .limits(
-                    Limits::NONE
-                        .min_width(1.)
-                        .min_height(1.)
-                        .max_width(1920.)
-                        .max_height(1000.),
-                )
-                .into()
-        } else {
-            let suggested = self.core.applet.suggested_size(false);
-            iced::widget::row!()
-                .width(Length::Fixed(suggested.0 as f32))
-                .height(Length::Fixed(suggested.1 as f32))
-                .into()
-        }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        // The previews' pictures follow the windows while they show.
-        let refresh = if self.preview_of().is_some() {
-            iced::time::every(PREVIEW_REFRESH).map(|_| Message::RefreshPreview)
-        } else {
-            Subscription::none()
-        };
-        Subscription::batch([
-            refresh,
-            launcher_entry::subscription().map(Message::Badge),
-            wayland_subscription().map(Message::Wayland),
-            listen_with(|e, _, id| match e {
-                cosmic::iced::core::Event::PlatformSpecific(event::PlatformSpecific::Wayland(
-                    event::wayland::Event::Seat(e, seat),
-                )) => match e {
-                    event::wayland::SeatEvent::Enter => Some(Message::NewSeat(seat)),
-                    event::wayland::SeatEvent::Leave => Some(Message::RemovedSeat),
-                },
-                cosmic::iced::core::Event::Mouse(
-                    cosmic::iced::core::mouse::Event::ButtonPressed(_),
-                ) => Some(Message::Pressed(id)),
-                cosmic::iced::core::Event::Mouse(cosmic::iced::core::mouse::Event::CursorLeft) => {
-                    Some(Message::PointerLeft(id))
-                }
-                _ => None,
-            }),
-            rectangle_tracker_subscription(0).map(|update| Message::Rectangle(update.1)),
-            self.core.watch_config(LIST_ID).map(|u| {
-                for why in u.errors {
-                    tracing::error!(why = why.to_string(), "Error watching config");
-                }
-                Message::ConfigUpdated(u.config)
-            }),
-        ])
-    }
-
-    fn style(&self) -> Option<iced::theme::Style> {
-        Some(cosmic::applet::style())
-    }
-
-    fn on_close_requested(&self, id: window::Id) -> Option<Message> {
-        Some(Message::CloseRequested(id))
     }
 }
 

@@ -52,6 +52,8 @@ pub enum State {
 #[derive(Debug, Clone)]
 pub struct WaylandImage {
     pub handle: Handle,
+    pub width: u32,
+    pub height: u32,
 }
 
 impl WaylandImage {
@@ -59,6 +61,8 @@ impl WaylandImage {
         let (width, height) = (img.width(), img.height());
         Self {
             handle: Handle::from_rgba(width, height, Bytes::from_owner(img.into_vec())),
+            width,
+            height,
         }
     }
 }

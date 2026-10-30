@@ -1,6 +1,8 @@
 // Copyright 2023 System76 <info@system76.com>, 2026 Aenes0
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod capture_wait;
+
 use crate::wayland_subscription::{
     OutputUpdate, ToplevelRequest, ToplevelUpdate, WaylandImage, WaylandRequest, WaylandUpdate,
 };
@@ -9,7 +11,7 @@ use std::{
         fd::{AsFd, FromRawFd, RawFd},
         unix::net::UnixStream,
     },
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::Arc,
 };
 
 use cctk::{
@@ -273,18 +275,8 @@ impl ToplevelInfoHandler for AppData {
 
 // Screencopy handling
 
-#[derive(Default)]
-struct SessionInner {
-    formats: Option<Formats>,
-    res: Option<Result<(), WEnum<FailureReason>>>,
-}
-
 // TODO: dmabuf? need to handle modifier negotation
-#[derive(Default)]
-struct Session {
-    condvar: Condvar,
-    inner: Mutex<SessionInner>,
-}
+type Session = capture_wait::Shared<Formats>;
 
 #[derive(Default)]
 struct SessionData {
@@ -294,27 +286,12 @@ struct SessionData {
 
 struct FrameData {
     frame_data: ScreencopyFrameData,
-    session: CaptureSession,
+    // Not the CaptureSession: that would keep it alive until the frame ends.
+    session: Arc<Session>,
 }
 
-impl Session {
-    pub fn for_session(session: &CaptureSession) -> Option<&Self> {
-        Some(&session.data::<SessionData>()?.session)
-    }
-
-    fn update<F: FnOnce(&mut SessionInner)>(&self, f: F) {
-        f(&mut self.inner.lock().unwrap());
-        self.condvar.notify_all();
-    }
-
-    fn wait_while<F: FnMut(&SessionInner) -> bool>(
-        &self,
-        mut f: F,
-    ) -> MutexGuard<'_, SessionInner> {
-        self.condvar
-            .wait_while(self.inner.lock().unwrap(), |data| f(data))
-            .unwrap()
-    }
+fn session_of(session: &CaptureSession) -> Option<&Session> {
+    Some(&session.data::<SessionData>()?.session)
 }
 
 impl ScreencopySessionDataExt for SessionData {
@@ -363,19 +340,11 @@ struct CaptureData {
 impl CaptureData {
     pub fn capture_source_shm_fd<Fd: AsFd>(
         &self,
-        overlay_cursor: bool,
         source: &ExtForeignToplevelHandleV1,
         fd: Fd,
-        len: Option<u32>,
-    ) -> Option<ShmImage<Fd>> {
-        // XXX error type?
+    ) -> Result<ShmImage<Fd>, String> {
         // TODO: way to get cursor metadata?
-
-        #[allow(unused_variables)] // TODO
-        let overlay_cursor = if overlay_cursor { 1 } else { 0 };
-
         let session = Arc::new(Session::default());
-        // Unwrap assumes compositor supports this capture type
         let capture_session = self
             .capturer
             .create_session(
@@ -387,74 +356,71 @@ impl CaptureData {
                     session_data: ScreencopySessionData::default(),
                 },
             )
-            .unwrap();
-        self.conn.flush().unwrap();
+            .map_err(|_| "cannot capture this window".to_string())?;
+        self.conn.flush().map_err(|e| format!("flush: {e}"))?;
 
-        let formats = session
-            .wait_while(|data| data.formats.is_none())
-            .formats
-            .take()
-            .unwrap();
+        let formats = session.wait_formats(capture_wait::TIMEOUT)?;
         let (width, height) = formats.buffer_size;
-
         if width == 0 || height == 0 {
-            return None;
+            return Err("window has no size".to_string());
         }
-
         // XXX
         if !formats.shm_formats.contains(&wl_shm::Format::Abgr8888) {
-            tracing::error!("No suitable buffer format found");
             tracing::warn!("Available formats: {:#?}", formats);
-            return None;
+            return Err("no suitable buffer format found".to_string());
         }
-
-        let buf_len = width * height * 4;
-        if let Some(len) = len {
-            if len != buf_len {
-                return None;
+        let buf_len = u64::from(width) * u64::from(height) * 4;
+        let pool_len = i32::try_from(buf_len).map_err(|_| "window too big".to_string())?;
+        // A failed resize shows up as a failed capture.
+        let _ = rustix::fs::ftruncate(&fd, buf_len);
+        let shot = self.shoot(&capture_session, &session, fd.as_fd(), (width, height), pool_len);
+        match shot {
+            Ok(()) => Ok(ShmImage { fd, width, height }),
+            Err(why) => {
+                if !capture_wait::should_release(&Err(why.clone())) {
+                    // The compositor may still write into it: never close it.
+                    std::mem::forget(fd);
+                }
+                Err(why)
             }
-        } else if let Err(_err) = rustix::fs::ftruncate(&fd, buf_len.into()) {
         }
-        let pool = self
-            .wl_shm
-            .create_pool(fd.as_fd(), buf_len as i32, &self.qh, ());
-        let buffer = pool.create_buffer(
-            0,
-            width as i32,
-            height as i32,
-            width as i32 * 4,
-            wl_shm::Format::Abgr8888,
-            &self.qh,
-            (),
-        );
+    }
 
+    /// Asks for one frame and waits for it; the pool and buffer are always destroyed.
+    fn shoot(
+        &self,
+        capture_session: &CaptureSession,
+        session: &Arc<Session>,
+        fd: std::os::fd::BorrowedFd<'_>,
+        (width, height): (u32, u32),
+        pool_len: i32,
+    ) -> Result<(), String> {
+        // Sizes are checked: both fit in an i32 and `width * 4` cannot overflow it.
+        let (w, h) = (width as i32, height as i32);
+        let pool = self.wl_shm.create_pool(fd, pool_len, &self.qh, ());
+        let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Abgr8888, &self.qh, ());
         capture_session.capture(
             &buffer,
             &[],
             &self.qh,
             FrameData {
                 frame_data: ScreencopyFrameData::default(),
-                session: capture_session.clone(),
+                session: session.clone(),
             },
         );
-        self.conn.flush().unwrap();
-
         // TODO: wait for server to release buffer?
-        let res = session
-            .wait_while(|data| data.res.is_none())
-            .res
-            .take()
-            .unwrap();
-        pool.destroy();
-        buffer.destroy();
-
-        //std::thread::sleep(std::time::Duration::from_millis(16));
-
-        if res.is_ok() {
-            Some(ShmImage { fd, width, height })
-        } else {
-            None
+        let res = self
+            .conn
+            .flush()
+            .map_err(|e| format!("flush: {e}"))
+            .and_then(|()| session.wait_result(capture_wait::TIMEOUT));
+        // After a timeout the frame is still pending: destroying its buffer
+        // could make the compositor crash, so the pool and buffer leak.
+        if capture_wait::should_release(&res) {
+            pool.destroy();
+            buffer.destroy();
         }
+        res
     }
 }
 
@@ -528,29 +494,49 @@ impl AppData {
             wl_shm: self.shm_state.wl_shm().clone(),
             capturer: self.screencopy_state.capturer().clone(),
         };
-        std::thread::spawn(move || {
-            let fail = |why: &str| {
-                tracing::debug!("no picture of a window: {why}");
-                let _ = tx.unbounded_send(WaylandUpdate::ImageFailed(handle.clone()));
-            };
-            let name = c"taskbar-screencopy";
-            let Ok(fd) = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC) else {
-                return fail("no memfd");
-            };
-            let Some(img) = capture_data.capture_source_shm_fd(false, &handle, fd, None) else {
-                return fail("capture failed");
-            };
-            // Small enough for a thumbnail, sharp on a scaled screen.
-            let img = match img.thumbnail(400) {
-                Ok(img) => img,
-                Err(err) => return fail(&err.to_string()),
-            };
-            if let Err(err) =
-                tx.unbounded_send(WaylandUpdate::Image(handle, WaylandImage::new(img)))
-            {
-                tracing::error!("Failed to send image event to subscription {err:?}");
-            }
-        });
+        let job_handle = handle.clone();
+        // `done` answers exactly once: image or failure, also if the thread never runs.
+        capture_wait::run_once(
+            move || capture_thumbnail(&capture_data, &job_handle),
+            move |img| {
+                let update = match img {
+                    Some(img) => WaylandUpdate::Image(handle, WaylandImage::new(img)),
+                    None => WaylandUpdate::ImageFailed(handle),
+                };
+                if let Err(err) = tx.unbounded_send(update) {
+                    tracing::error!("Failed to send image event to subscription {err:?}");
+                }
+            },
+            |task| {
+                let spawned = std::thread::Builder::new()
+                    .name("taskbar-capture".into())
+                    .spawn(task);
+                if let Err(err) = spawned {
+                    // The task is dropped unrun, which reports the failure.
+                    tracing::warn!("cannot start the capture thread: {err}");
+                }
+            },
+        );
+    }
+}
+
+/// One thumbnail of a window, `None` (and a log line) when it cannot be taken.
+fn capture_thumbnail(
+    capture_data: &CaptureData,
+    handle: &ExtForeignToplevelHandleV1,
+) -> Option<image::RgbaImage> {
+    let name = c"taskbar-screencopy";
+    let result = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC)
+        .map_err(|e| format!("no memfd: {e}"))
+        .and_then(|fd| capture_data.capture_source_shm_fd(handle, fd))
+        // Small enough for a thumbnail, sharp on a scaled screen.
+        .and_then(|img| img.thumbnail(400).map_err(|e| e.to_string()));
+    match result {
+        Ok(img) => Some(img),
+        Err(why) => {
+            tracing::debug!("no picture of a window: {why}");
+            None
+        }
     }
 }
 
@@ -572,9 +558,9 @@ impl ScreencopyHandler for AppData {
         session: &CaptureSession,
         formats: &Formats,
     ) {
-        Session::for_session(session).unwrap().update(|data| {
-            data.formats = Some(formats.clone());
-        });
+        if let Some(shared) = session_of(session) {
+            shared.update(|data| data.formats = Some(formats.clone()));
+        }
     }
 
     fn ready(
@@ -584,10 +570,9 @@ impl ScreencopyHandler for AppData {
         screencopy_frame: &CaptureFrame,
         _frame: Frame,
     ) {
-        let session = &screencopy_frame.data::<FrameData>().unwrap().session;
-        Session::for_session(session).unwrap().update(|data| {
-            data.res = Some(Ok(()));
-        });
+        if let Some(frame) = screencopy_frame.data::<FrameData>() {
+            frame.session.update(|data| data.res = Some(Ok(())));
+        }
     }
 
     fn failed(
@@ -597,14 +582,19 @@ impl ScreencopyHandler for AppData {
         screencopy_frame: &CaptureFrame,
         reason: WEnum<FailureReason>,
     ) {
-        // TODO send message to thread
-        let session = &screencopy_frame.data::<FrameData>().unwrap().session;
-        Session::for_session(session).unwrap().update(|data| {
-            data.res = Some(Err(reason));
-        });
+        if let Some(frame) = screencopy_frame.data::<FrameData>() {
+            frame
+                .session
+                .update(|data| data.res = Some(Err(format!("capture failed: {reason:?}"))));
+        }
     }
 
-    fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _session: &CaptureSession) {}
+    fn stopped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, session: &CaptureSession) {
+        // A stopped session will never answer: release the waiting thread.
+        if let Some(shared) = session_of(session) {
+            shared.update(|data| data.stopped = true);
+        }
+    }
 }
 
 pub(crate) fn wayland_handler(
