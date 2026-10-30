@@ -1158,10 +1158,10 @@ impl Taskbar {
             return Task::none();
         };
         let Some(rectangle) = self.rectangles.get(&id.into()).copied() else {
-            tracing::info!("DIAG open_preview id={id}: no rectangle");
+            tracing::trace!("DIAG open_preview id={id}: no rectangle");
             return Task::none();
         };
-        tracing::info!("DIAG open_preview id={id} parent={parent:?} rect={rectangle:?}");
+        tracing::trace!("DIAG open_preview id={id} parent={parent:?} rect={rectangle:?}");
         self.capture_windows(id);
         let new_id = window::Id::unique();
         self.preview_hovered = false;
@@ -2208,7 +2208,7 @@ impl Taskbar {
                 return Task::batch([close, self.open_preview(id, parent_window_id)]);
             }
             Message::IconHover(id, parent_window_id, entering) => {
-                tracing::info!("DIAG IconHover id={id} parent={parent_window_id:?} entering={entering} preview_of={:?} hover={:?} popup={:?}", self.preview_of(), self.hover, self.popup.as_ref().map(|p| (p.id, p.popup_type == PopupType::Preview)));
+                tracing::trace!("DIAG IconHover id={id} parent={parent_window_id:?} entering={entering} preview_of={:?} hover={:?} popup={:?}", self.preview_of(), self.hover, self.popup.as_ref().map(|p| (p.id, p.popup_type == PopupType::Preview)));
                 self.hover_gen += 1;
                 let hover_gen = self.hover_gen;
                 if entering {
@@ -2237,7 +2237,7 @@ impl Taskbar {
                 if entering {
                     self.preview_closing = false;
                 }
-                tracing::info!("DIAG PreviewHover entering={entering}");
+                tracing::trace!("DIAG PreviewHover entering={entering}");
                 self.hover_gen += 1;
                 self.preview_hovered = entering;
                 if !entering {
@@ -2247,7 +2247,7 @@ impl Taskbar {
             }
             Message::PreviewOnStart => return self.preview_on_start(),
             Message::PointerLeft(id) => {
-                tracing::info!("DIAG PointerLeft id={id:?} hover={:?}", self.hover);
+                tracing::trace!("DIAG PointerLeft id={id:?} hover={:?}", self.hover);
                 // Out of a surface fast, past its edge, its widgets may keep
                 // the pointer's last place inside them and never see it
                 // leave: the surface's own event says it.
@@ -2261,7 +2261,7 @@ impl Taskbar {
                 }
             }
             Message::HoverSettled(hover_gen) => {
-                tracing::info!("DIAG HoverSettled gen={hover_gen} cur={} preview_hovered={} preview_of={:?} menu_open={} hover={:?} has_windows={:?}", self.hover_gen, self.preview_hovered, self.preview_of(), self.menu_open(), self.hover, self.hover.map(|(id, _)| self.has_windows(id)));
+                tracing::trace!("DIAG HoverSettled gen={hover_gen} cur={} preview_hovered={} preview_of={:?} menu_open={} hover={:?} has_windows={:?}", self.hover_gen, self.preview_hovered, self.preview_of(), self.menu_open(), self.hover, self.hover.map(|(id, _)| self.has_windows(id)));
                 if hover_gen != self.hover_gen
                     || (self.preview_hovered && self.preview_of().is_some())
                 {
@@ -2352,7 +2352,7 @@ impl Taskbar {
                 }
             }
             Message::Toggle(handle) => {
-                tracing::info!(
+                tracing::trace!(
                     "DIAG Toggle focused={} activated={} active_now={} states={:?}",
                     self.is_focused(&handle),
                     self.is_activated(&handle),
@@ -2893,7 +2893,7 @@ impl Taskbar {
                         .collect();
             }
             Message::CloseRequested(id) => {
-                tracing::info!("DIAG CloseRequested id={id:?}");
+                tracing::trace!("DIAG CloseRequested id={id:?}");
                 if Some(id) == self.popup.as_ref().map(|p| p.id) {
                     self.popup = None;
                 }
