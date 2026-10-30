@@ -457,6 +457,10 @@ pub struct Taskbar {
     /// How far the open preview has faded in (0 to 1).
     preview_fade: crate::anim::Spring,
     preview_fade_last: Option<std::time::Instant>,
+    /// The window this bar last asked to bring forward: on another monitor
+    /// the compositor is slow to say it is active, so a click soon after
+    /// minimizes it rather than asking again.
+    last_activate: Option<(ExtForeignToplevelHandleV1, std::time::Instant)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -570,6 +574,9 @@ const TOPLEVEL_BUTTON_WIDTH: f32 = 232.0;
 const TOPLEVEL_BUTTON_HEIGHT: f32 = 170.0;
 /// How long the pointer rests on a button before its windows show, and
 /// how long they stay after it leaves, so it can get to them.
+/// How long after bringing a window forward from another monitor's bar the
+/// next click on it minimizes.
+const ACTIVATE_GRACE: Duration = Duration::from_secs(8);
 const HOVER_OPEN: Duration = Duration::from_millis(400);
 const HOVER_CLOSE: Duration = Duration::from_millis(300);
 /// How often the previews' pictures are taken again while they show.
@@ -1259,6 +1266,34 @@ impl Taskbar {
                 parent,
             )
             .into()
+    }
+
+    /// Whether this click should minimize: the window is active, or it is on
+    /// another monitor, shown, and this bar brought it forward a moment ago.
+    fn should_minimize(&self, handle: &ExtForeignToplevelHandleV1) -> bool {
+        if self.is_activated(handle) {
+            return true;
+        }
+        let Some((last, at)) = self.last_activate.as_ref() else {
+            return false;
+        };
+        if last != handle || at.elapsed() > ACTIVATE_GRACE {
+            return false;
+        }
+        let current_output = &self.core.applet.output_name;
+        self.active_list
+            .iter()
+            .chain(self.pinned_list.iter())
+            .flat_map(|i| i.toplevels.iter())
+            .find(|(info, _)| info.foreign_toplevel == *handle)
+            .is_some_and(|(info, _)| {
+                let here = info.output.iter().any(|o| {
+                    self.output_list
+                        .get(o)
+                        .is_some_and(|v| v.name.as_ref().is_some_and(|n| n == current_output))
+                });
+                !here && !info.state.contains(&State::Minimized)
+            })
     }
 
     /// Whether this window is the active one on whichever monitor it is on:
@@ -2260,8 +2295,14 @@ impl Taskbar {
                         .find(|(info, _)| info.foreign_toplevel == handle)
                         .map(|(info, _)| info.state.clone())
                 );
+                let minimize = self.should_minimize(&handle);
+                self.last_activate = if minimize {
+                    None
+                } else {
+                    Some((handle.clone(), std::time::Instant::now()))
+                };
                 if let Some(tx) = self.wayland_sender.as_ref() {
-                    let _ = tx.send(WaylandRequest::Toplevel(if self.is_activated(&handle) {
+                    let _ = tx.send(WaylandRequest::Toplevel(if minimize {
                         ToplevelRequest::Minimize(handle)
                     } else {
                         ToplevelRequest::Activate(handle)
