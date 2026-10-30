@@ -457,6 +457,10 @@ pub struct Taskbar {
     /// How far the open preview has faded in (0 to 1).
     preview_fade: crate::anim::Spring,
     preview_fade_last: Option<std::time::Instant>,
+    /// The preview is fading out; it is destroyed when the fade ends.
+    preview_closing: bool,
+    /// Per window: how far its card has lifted under the pointer (0 to 1).
+    preview_lift: Vec<(ExtForeignToplevelHandleV1, crate::anim::Spring)>,
     /// The window this bar last asked to bring forward: on another monitor
     /// the compositor is slow to say it is active, so a click soon after
     /// minimizes it rather than asking again.
@@ -570,8 +574,8 @@ async fn try_get_gpus() -> Option<Vec<Gpu>> {
     Some(gpus)
 }
 
-const TOPLEVEL_BUTTON_WIDTH: f32 = 232.0;
-const TOPLEVEL_BUTTON_HEIGHT: f32 = 170.0;
+const TOPLEVEL_BUTTON_WIDTH: f32 = 330.0;
+const TOPLEVEL_BUTTON_HEIGHT: f32 = 260.0;
 /// How long the pointer rests on a button before its windows show, and
 /// how long they stay after it leaves, so it can get to them.
 /// How long after bringing a window forward from another monitor's bar the
@@ -584,104 +588,98 @@ const PREVIEW_REFRESH: Duration = Duration::from_millis(1000);
 
 /// A window, as Windows 11 previews it: the app's icon, the title and the
 /// close button on top, the window's picture under them.
-/// The picture's box inside a card; the picture fits it by its own shape.
-const PREVIEW_BOX_W: f32 = 208.0;
-const PREVIEW_BOX_H: f32 = 124.0;
-const PREVIEW_PICTURE_RADIUS: f32 = 12.0;
+/// Every picture fits this box by its own shape, so side by side they share
+/// a height and differ in width, as on macOS. At rest it is a little
+/// smaller, and grows into the box under the pointer.
+const PREVIEW_MAX_W: f32 = 300.0;
+const PREVIEW_MAX_H: f32 = 150.0;
+const PREVIEW_LIFT: f32 = 0.06;
+const PREVIEW_RADIUS: f32 = 10.0;
+const PREVIEW_BADGE: f32 = 30.0;
 static PREVIEW_AUTOSIZE_ID: std::sync::LazyLock<iced::id::Id> =
     std::sync::LazyLock::new(|| iced::id::Id::new("taskbar-preview-autosize"));
 
-/// `t` (0 to 1) is how far the preview has faded in.
+/// `t` (0 to 1) is how far the preview has faded in, `lift` how far this card has grown.
 fn toplevel_button<'a>(
     img: Option<&WaylandImage>,
     app_icon: icon::Handle,
-    title: String,
     handle: ExtForeignToplevelHandleV1,
-    is_focused: bool,
     is_hovered: bool,
     t: f32,
+    lift: f32,
 ) -> Element<'a, Message> {
-    let title = if title.trim().is_empty() {
-        texts().untitled.to_string()
-    } else {
-        title
-    };
     let fade = move |mut c: iced::Color| {
         c.a *= t;
         c
     };
     let has_picture = img.is_some();
+    let grow = 1.0 + PREVIEW_LIFT * lift.clamp(0.0, 1.2);
+    let rest = 1.0 / (1.0 + PREVIEW_LIFT);
 
-    // Fit the picture in its box by the window's own shape.
+    // Fit by the window's own shape: a wide one is limited by the width, a
+    // tall one by the height.
     let (pw, ph) = match img {
         Some(i) if i.width > 0 && i.height > 0 => {
-            let scale = (PREVIEW_BOX_W / i.width as f32).min(PREVIEW_BOX_H / i.height as f32);
+            let scale = (PREVIEW_MAX_W / i.width as f32).min(PREVIEW_MAX_H / i.height as f32);
             (
                 (i.width as f32 * scale).round().max(1.0),
                 (i.height as f32 * scale).round().max(1.0),
             )
         }
-        _ => (PREVIEW_BOX_W, PREVIEW_BOX_H),
+        _ => (PREVIEW_MAX_W * 0.66, PREVIEW_MAX_H * 0.83),
     };
+    let (box_w, box_h) = (pw, ph);
+    let (dw, dh) = ((pw * rest * grow).round(), (ph * rest * grow).round());
+
     let picture: Element<_> = match img {
         Some(img) => Image::new(img.handle.clone())
-            .width(Length::Fixed(pw - 2.0))
-            .height(Length::Fixed(ph - 2.0))
+            .width(Length::Fixed(dw))
+            .height(Length::Fixed(dh))
             .content_fit(iced::ContentFit::Fill)
-            .border_radius(PREVIEW_PICTURE_RADIUS - 1.0)
+            .border_radius(PREVIEW_RADIUS)
             .opacity(t)
             .into(),
         // A minimized window has no picture: its app's icon, big, instead.
         None => icon::icon(app_icon.clone()).size(48).into(),
     };
     let frame = container(picture)
-        .center(Length::Fixed(pw))
-        .height(Length::Fixed(ph))
+        .center(Length::Fixed(dw))
+        .height(Length::Fixed(dh))
         .class(Container::custom(move |theme| {
             let cosmic = theme.cosmic();
             container::Style {
                 background: (!has_picture).then(|| {
                     Background::Color(fade(iced::Color {
-                        a: 0.08,
+                        a: 0.10,
                         ..cosmic.on_bg_color().into()
                     }))
                 }),
-                border: if is_focused {
-                    Border {
-                        radius: PREVIEW_PICTURE_RADIUS.into(),
-                        width: 2.0,
-                        color: fade(cosmic.accent_color().into()),
-                    }
-                } else if is_hovered {
-                    Border {
-                        radius: PREVIEW_PICTURE_RADIUS.into(),
-                        width: 2.0,
-                        color: fade(iced::Color {
-                            a: 0.6,
-                            ..cosmic.on_bg_color().into()
-                        }),
-                    }
-                } else {
-                    Border {
-                        radius: PREVIEW_PICTURE_RADIUS.into(),
-                        width: 1.0,
-                        color: fade(iced::Color {
-                            a: 0.18,
-                            ..cosmic.on_bg_color().into()
-                        }),
-                    }
+                border: Border {
+                    radius: PREVIEW_RADIUS.into(),
+                    ..Default::default()
                 },
                 shadow: iced::Shadow {
-                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.35 * t),
-                    offset: iced::Vector::new(0.0, 4.0),
-                    blur_radius: 14.0,
+                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.30 * t),
+                    offset: iced::Vector::new(0.0, 3.0),
+                    blur_radius: 10.0,
                 },
                 ..Default::default()
             }
         }));
 
-    // As on macOS: a round close button in the picture's corner, only
-    // while the pointer is on the card.
+    // The app's icon on the picture's lower right corner, as on macOS; it has
+    // no alpha, so it shows once the card is mostly in.
+    let badge: Element<_> = if t > 0.6 {
+        container(icon::icon(app_icon).size(PREVIEW_BADGE as u16))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::End)
+            .into()
+    } else {
+        horizontal_space().width(Length::Shrink).into()
+    };
+    // A round close button at the upper right, only while the pointer is on the card.
     let close: Element<_> = if is_hovered {
         container(
             button::custom(icon::from_name("window-close-symbolic").size(12))
@@ -689,45 +687,28 @@ fn toplevel_button<'a>(
                 .on_press(Message::CloseToplevel(handle.clone()))
                 .padding(4),
         )
+        .width(Length::Fill)
+        .height(Length::Fill)
         .padding(6)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Start)
         .into()
     } else {
         horizontal_space().width(Length::Shrink).into()
     };
-    let thumb = container(iced::widget::stack![frame, close])
-        .width(Length::Fixed(PREVIEW_BOX_W))
-        .height(Length::Fixed(PREVIEW_BOX_H))
-        .center_x(Length::Fixed(PREVIEW_BOX_W))
-        .center_y(Length::Fixed(PREVIEW_BOX_H));
+    let centered = container(frame)
+        .width(Length::Fixed(box_w))
+        .height(Length::Fixed(box_h))
+        .center_x(Length::Fixed(box_w))
+        .center_y(Length::Fixed(box_h));
+    let card = container(iced::widget::stack![centered, close, badge])
+        .width(Length::Fixed(box_w))
+        .height(Length::Fixed(box_h));
 
-    let title_color = fade(theme::active().cosmic().on_bg_color().into());
-    let caption = row![
-        // The little icon has no alpha: it shows once the card is mostly in.
-        if t > 0.6 {
-            Element::from(icon::icon(app_icon).size(16))
-        } else {
-            horizontal_space().width(Length::Fixed(16.0)).into()
-        },
-        text::body(title)
-            .class(theme::Text::Color(title_color))
-            .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
-            .width(Length::Shrink),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-    let caption = container(caption)
-        .center_x(Length::Fill)
-        .height(Length::Fixed(22.0));
-
-    column![thumb, caption]
-        .spacing(8)
-        .apply(button::custom)
+    card.apply(button::custom)
         .on_press(Message::Toggle(handle.clone()))
         .class(preview_card_style())
-        .width(Length::Fixed(TOPLEVEL_BUTTON_WIDTH))
-        .height(Length::Fixed(TOPLEVEL_BUTTON_HEIGHT))
-        .padding([8, 8, 8, 8])
-        .selected(is_focused)
+        .padding(0)
         .apply(mouse_area)
         .on_enter(Message::ToplevelHoverChanged(handle.clone(), true))
         .on_middle_press(Message::CloseToplevel(handle.clone()))
@@ -1119,7 +1100,45 @@ impl Taskbar {
         }
     }
 
+    /// Closes the preview with a short fade; at once if motion is off.
+    fn begin_close_preview(&mut self) -> Task<cosmic::Action<Message>> {
+        let showing = self.popup.as_ref().is_some_and(|p| p.popup_type == PopupType::Preview);
+        if showing && crate::anim::motion_scale() > 0.0 {
+            if !self.preview_closing {
+                self.preview_closing = true;
+                self.preview_fade_last = None;
+            }
+            Task::none()
+        } else {
+            self.close_preview()
+        }
+    }
+
+    fn preview_handles(&self) -> Vec<ExtForeignToplevelHandleV1> {
+        self.preview_of()
+            .and_then(|id| self.item(id))
+            .map(|i| i.toplevels.iter().map(|(info, _)| info.foreign_toplevel.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn lift_target(&self, handle: &ExtForeignToplevelHandleV1) -> f32 {
+        if !self.preview_closing && self.hovered_toplevel.as_ref() == Some(handle) { 1.0 } else { 0.0 }
+    }
+
+    fn lift_of(&self, handle: &ExtForeignToplevelHandleV1) -> f32 {
+        self.preview_lift.iter().find(|(h, _)| h == handle).map_or(0.0, |(_, s)| s.pos)
+    }
+
+    /// Whether anything in the open preview still moves: the fade, a card's lift.
+    fn preview_animating(&self) -> bool {
+        self.preview_of().is_some()
+            && (self.preview_closing
+                || !self.preview_fade.settled(1.0)
+                || self.preview_lift.iter().any(|(h, s)| !s.settled(self.lift_target(h))))
+    }
+
     fn close_preview(&mut self) -> Task<cosmic::Action<Message>> {
+        self.preview_closing = false;
         self.preview_hovered = false;
         self.hovered_toplevel = None;
         match self.popup.take() {
@@ -1148,6 +1167,8 @@ impl Taskbar {
         self.preview_hovered = false;
         self.preview_fade = crate::anim::Spring::new(if crate::anim::motion_scale() > 0.0 { 0.0 } else { 1.0 });
         self.preview_fade_last = None;
+        self.preview_closing = false;
+        self.preview_lift.clear();
         self.popup = Some(Popup {
             parent,
             id: new_id,
@@ -1801,27 +1822,27 @@ impl cosmic::Application for Taskbar {
                         desktop_info.icon().unwrap_or_default(),
                     )
                     .as_cosmic_icon();
+                    let fade = self.preview_fade.pos.clamp(0.0, 1.0);
                     let cards = toplevels.iter().map(|(info, img)| {
                         toplevel_button(
                             img.as_ref(),
                             app_icon.clone(),
-                            info.title.clone(),
                             info.foreign_toplevel.clone(),
-                            self.is_focused(&info.foreign_toplevel),
                             self.is_hovered(&info.foreign_toplevel),
-                            self.preview_fade.pos.clamp(0.0, 1.0),
+                            fade,
+                            self.lift_of(&info.foreign_toplevel),
                         )
                     });
                     let content: Element<_> = if self.core.applet.is_horizontal() {
                         Row::with_children(cards)
-                            .padding(12)
-                            .spacing(6)
+                            .padding(10)
+                            .spacing(10)
                             .align_y(Alignment::Center)
                             .into()
                     } else {
                         Column::with_children(cards)
-                            .padding(8)
-                            .spacing(8)
+                            .padding(10)
+                            .spacing(10)
                             .align_x(Alignment::Center)
                             .into()
                     };
@@ -1831,29 +1852,59 @@ impl cosmic::Application for Taskbar {
                         PanelAnchor::Top => (iced::alignment::Vertical::Top, iced::alignment::Horizontal::Center),
                         PanelAnchor::Bottom => (iced::alignment::Vertical::Bottom, iced::alignment::Horizontal::Center),
                     };
-                    let fade = self.preview_fade.pos.clamp(0.0, 1.0);
-                    let glass = container(content).class(Container::custom(move |theme| {
-                        let cosmic = theme.cosmic();
-                        let mut base: iced::Color = cosmic.background(theme.transparent).base.into();
-                        base.a = 0.78 * fade.max(0.35);
-                        container::Style {
-                            background: Some(Background::Color(base)),
-                            border: Border {
-                                radius: 22.0.into(),
-                                width: 1.0,
-                                color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.16),
+                    let glass_style = move |radius: f32, shadow: f32| {
+                        Container::custom(move |theme: &cosmic::Theme| {
+                            let cosmic = theme.cosmic();
+                            let mut base: iced::Color = cosmic.background(theme.transparent).base.into();
+                            base.a = 0.78 * fade;
+                            container::Style {
+                                background: Some(Background::Color(base)),
+                                border: Border {
+                                    radius: radius.into(),
+                                    ..Default::default()
+                                },
+                                shadow: iced::Shadow {
+                                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, shadow * fade),
+                                    offset: iced::Vector::new(0.0, 8.0),
+                                    blur_radius: 28.0,
+                                },
+                                ..Default::default()
+                            }
+                        })
+                    };
+                    // The app's name in a pill over the panel's upper left, as on macOS.
+                    let name = desktop_info.full_name(&self.locales).unwrap_or_default().into_owned();
+                    let name_color = {
+                        let mut c: iced::Color = theme::active().cosmic().on_bg_color().into();
+                        c.a *= fade;
+                        c
+                    };
+                    let pill = container(
+                        row![
+                            if fade > 0.6 {
+                                Element::from(icon::icon(app_icon.clone()).size(20))
+                            } else {
+                                horizontal_space().width(Length::Fixed(20.0)).into()
                             },
-                            shadow: iced::Shadow {
-                                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-                                offset: iced::Vector::new(0.0, 8.0),
-                                blur_radius: 24.0,
-                            },
-                            ..Default::default()
-                        }
-                    }));
+                            text::body(name).class(theme::Text::Color(name_color)),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([6, 12])
+                    .class(glass_style(16.0, 0.25));
+                    // One window: its picture alone, with no panel and no name; two
+                    // or more: the glass panel with the app's name over it.
+                    let stack: Element<_> = if toplevels.len() == 1 {
+                        content
+                    } else {
+                        column![container(pill).align_x(Alignment::Start), container(content).class(glass_style(22.0, 0.35))]
+                            .spacing(8)
+                            .into()
+                    };
                     mouse_area(
                         cosmic::widget::autosize::autosize(
-                            container(glass)
+                            container(stack)
                                 .height(Length::Shrink)
                                 .align_x(horizontal)
                                 .align_y(vertical),
@@ -2028,7 +2079,7 @@ impl cosmic::Application for Taskbar {
         } else {
             Subscription::none()
         };
-        let fade = if self.preview_of().is_some() && !self.preview_fade.settled(1.0) {
+        let fade = if self.preview_animating() {
             iced::time::every(Duration::from_millis(8)).map(|_| Message::PreviewFadeTick)
         } else {
             Subscription::none()
@@ -2161,6 +2212,7 @@ impl Taskbar {
                 self.hover_gen += 1;
                 let hover_gen = self.hover_gen;
                 if entering {
+                    self.preview_closing = false;
                     self.hover = Some((id, parent_window_id));
                     // From one button to the next with the previews up, they
                     // follow at once, as on Windows.
@@ -2182,6 +2234,9 @@ impl Taskbar {
                 return after(HOVER_CLOSE, Message::HoverSettled(hover_gen));
             }
             Message::PreviewHover(entering) => {
+                if entering {
+                    self.preview_closing = false;
+                }
                 tracing::info!("DIAG PreviewHover entering={entering}");
                 self.hover_gen += 1;
                 self.preview_hovered = entering;
@@ -2223,16 +2278,30 @@ impl Taskbar {
                             return Task::batch([close, self.open_preview(id, parent)]);
                         }
                     }
-                    _ => return self.close_preview(),
+                    _ => return self.begin_close_preview(),
                 }
             }
             Message::PreviewFadeTick => {
                 let now = std::time::Instant::now();
                 let dt = self.preview_fade_last.map_or(0.0, |t| (now - t).as_secs_f32());
                 self.preview_fade_last = Some(now);
-                self.preview_fade.step(1.0, dt, 260.0, 26.0);
-                if self.preview_fade.settled(1.0) {
-                    self.preview_fade = crate::anim::Spring::new(1.0);
+                if self.preview_closing {
+                    self.preview_fade.step(0.0, dt, 520.0, 46.0);
+                    if self.preview_fade.pos < 0.03 {
+                        return self.close_preview();
+                    }
+                } else {
+                    self.preview_fade.step(1.0, dt, 260.0, 26.0);
+                    if self.preview_fade.settled(1.0) {
+                        self.preview_fade = crate::anim::Spring::new(1.0);
+                    }
+                }
+                for handle in self.preview_handles() {
+                    let target = self.lift_target(&handle);
+                    match self.preview_lift.iter_mut().find(|(h, _)| *h == handle) {
+                        Some((_, spring)) => spring.step(target, dt, 380.0, 24.0),
+                        None => self.preview_lift.push((handle, crate::anim::Spring::new(0.0))),
+                    }
                 }
             }
             Message::RefreshPreview => {
