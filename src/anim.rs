@@ -51,6 +51,12 @@ impl Spring {
     pub fn settled(&self, target: f32) -> bool {
         (self.pos - target).abs() < 0.002 && self.vel.abs() < 0.01
     }
+
+    /// Settled as far as the eye can tell: a card's lift or a fade within 2%
+    /// of where it is going. Stops the frames long before `settled` would.
+    pub fn settled_loose(&self, target: f32) -> bool {
+        (self.pos - target).abs() < 0.02 && self.vel.abs() < 0.2
+    }
 }
 
 const BOUNCE_FIRST_S: f32 = 0.5;
@@ -135,6 +141,24 @@ mod tests {
         }
         assert!(s.settled(1.7), "pos={} vel={}", s.pos, s.vel);
         assert!(peak <= 1.7 * 1.08, "peak={peak}");
+    }
+
+    #[test]
+    fn a_spring_is_loosely_settled_well_before_it_is_settled() {
+        let mut s = Spring::new(0.0);
+        let (mut loose_at, mut tight_at) = (None, None);
+        for frame in 0..600 {
+            s.step(1.0, 1.0 / 60.0, 380.0, 24.0);
+            if loose_at.is_none() && s.settled_loose(1.0) {
+                loose_at = Some(frame);
+            }
+            if tight_at.is_none() && s.settled(1.0) {
+                tight_at = Some(frame);
+            }
+        }
+        let (loose, tight) = (loose_at.unwrap(), tight_at.unwrap());
+        assert!(loose < tight, "loose {loose} tight {tight}");
+        assert!(loose < 45, "loosely settled after {loose} frames at 60 Hz");
     }
 
     #[test]

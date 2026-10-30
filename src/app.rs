@@ -581,6 +581,9 @@ const TOPLEVEL_BUTTON_HEIGHT: f32 = 260.0;
 /// How long after bringing a window forward from another monitor's bar the
 /// next click on it minimizes.
 const ACTIVATE_GRACE: Duration = Duration::from_secs(8);
+/// One frame of the preview's animations: 30 Hz keeps the software redraw cheap, and
+/// every frame is a full software redraw of the popup.
+const PREVIEW_FRAME: Duration = Duration::from_millis(33);
 const HOVER_OPEN: Duration = Duration::from_millis(400);
 const HOVER_CLOSE: Duration = Duration::from_millis(300);
 /// How often the previews' pictures are taken again while they show.
@@ -593,11 +596,62 @@ const PREVIEW_REFRESH: Duration = Duration::from_millis(1000);
 /// smaller, and grows into the box under the pointer.
 const PREVIEW_MAX_W: f32 = 300.0;
 const PREVIEW_MAX_H: f32 = 150.0;
-const PREVIEW_LIFT: f32 = 0.06;
+const PREVIEW_LIFT: f32 = 0.03;
 const PREVIEW_RADIUS: f32 = 10.0;
 const PREVIEW_BADGE: f32 = 30.0;
+const PREVIEW_LABEL_H: f32 = 48.0;
+const PREVIEW_LABEL_MAX_W: f32 = 420.0;
 static PREVIEW_AUTOSIZE_ID: std::sync::LazyLock<iced::id::Id> =
     std::sync::LazyLock::new(|| iced::id::Id::new("taskbar-preview-autosize"));
+
+/// A narrow (portrait) window's card is at least this wide, so its title has
+/// room and the card is not a sliver under the pointer.
+const PREVIEW_MIN_CARD_W: f32 = 150.0;
+const PREVIEW_PANEL_PAD: f32 = 5.0;
+const PREVIEW_PANEL_GAP: f32 = 6.0;
+
+/// The picture's size, fitted by the window's own shape.
+fn preview_picture_size(img: Option<&WaylandImage>) -> (f32, f32) {
+    match img {
+        Some(i) if i.width > 0 && i.height > 0 => {
+            let scale = (PREVIEW_MAX_W / i.width as f32).min(PREVIEW_MAX_H / i.height as f32);
+            (
+                (i.width as f32 * scale).round().max(1.0),
+                (i.height as f32 * scale).round().max(1.0),
+            )
+        }
+        _ => (PREVIEW_MAX_W * 0.66, PREVIEW_MAX_H * 0.83),
+    }
+}
+
+/// The label's normal size, and the two smaller ones it falls back to.
+const LABEL_SIZES: [f32; 3] = [14.0, 12.0, 11.0];
+/// How much of its size an average character takes of width.
+const LABEL_CHAR_EM: f32 = 0.56;
+
+/// The label's font size and number of lines for `title` in `width` px: one
+/// line at the normal size if it fits, else two lines, and two lines two and
+/// then three points smaller before it is cut.
+fn label_layout(title: &str, width: f32) -> (f32, u16) {
+    let chars = title.chars().count() as f32;
+    let per_line = |size: f32| (width / (LABEL_CHAR_EM * size)).floor();
+    let [normal, smaller, smallest] = LABEL_SIZES;
+    if chars <= per_line(normal) {
+        (normal, 1)
+    } else if chars <= 2.0 * per_line(normal) - 2.0 {
+        // Two lines lose a little to where the words break.
+        (normal, 2)
+    } else if chars <= 2.0 * per_line(smaller) - 2.0 {
+        (smaller, 2)
+    } else {
+        (smallest, 2)
+    }
+}
+
+/// The width a window's card takes in the row.
+fn preview_card_width(img: Option<&WaylandImage>) -> f32 {
+    preview_picture_size(img).0.max(PREVIEW_MIN_CARD_W)
+}
 
 /// `t` (0 to 1) is how far the preview has faded in, `lift` how far this card has grown.
 fn toplevel_button<'a>(
@@ -616,18 +670,7 @@ fn toplevel_button<'a>(
     let grow = 1.0 + PREVIEW_LIFT * lift.clamp(0.0, 1.2);
     let rest = 1.0 / (1.0 + PREVIEW_LIFT);
 
-    // Fit by the window's own shape: a wide one is limited by the width, a
-    // tall one by the height.
-    let (pw, ph) = match img {
-        Some(i) if i.width > 0 && i.height > 0 => {
-            let scale = (PREVIEW_MAX_W / i.width as f32).min(PREVIEW_MAX_H / i.height as f32);
-            (
-                (i.width as f32 * scale).round().max(1.0),
-                (i.height as f32 * scale).round().max(1.0),
-            )
-        }
-        _ => (PREVIEW_MAX_W * 0.66, PREVIEW_MAX_H * 0.83),
-    };
+    let (pw, ph) = preview_picture_size(img);
     let (box_w, box_h) = (pw, ph);
     let (dw, dh) = ((pw * rest * grow).round(), (ph * rest * grow).round());
 
@@ -705,7 +748,12 @@ fn toplevel_button<'a>(
         .width(Length::Fixed(box_w))
         .height(Length::Fixed(box_h));
 
-    card.apply(button::custom)
+    // A narrow picture sits in the middle of a card of the minimum width.
+    let outer = container(card)
+        .width(Length::Fixed(preview_card_width(img)))
+        .center_x(Length::Fixed(preview_card_width(img)));
+    outer
+        .apply(button::custom)
         .on_press(Message::Toggle(handle.clone()))
         .class(preview_card_style())
         .padding(0)
@@ -1133,8 +1181,8 @@ impl Taskbar {
     fn preview_animating(&self) -> bool {
         self.preview_of().is_some()
             && (self.preview_closing
-                || !self.preview_fade.settled(1.0)
-                || self.preview_lift.iter().any(|(h, s)| !s.settled(self.lift_target(h))))
+                || !self.preview_fade.settled_loose(1.0)
+                || self.preview_lift.iter().any(|(h, s)| !s.settled_loose(self.lift_target(h))))
     }
 
     fn close_preview(&mut self) -> Task<cosmic::Action<Message>> {
@@ -1835,14 +1883,14 @@ impl cosmic::Application for Taskbar {
                     });
                     let content: Element<_> = if self.core.applet.is_horizontal() {
                         Row::with_children(cards)
-                            .padding(10)
-                            .spacing(10)
+                            .padding(PREVIEW_PANEL_PAD)
+                            .spacing(PREVIEW_PANEL_GAP)
                             .align_y(Alignment::Center)
                             .into()
                     } else {
                         Column::with_children(cards)
-                            .padding(10)
-                            .spacing(10)
+                            .padding(PREVIEW_PANEL_PAD)
+                            .spacing(PREVIEW_PANEL_GAP)
                             .align_x(Alignment::Center)
                             .into()
                     };
@@ -1852,11 +1900,11 @@ impl cosmic::Application for Taskbar {
                         PanelAnchor::Top => (iced::alignment::Vertical::Top, iced::alignment::Horizontal::Center),
                         PanelAnchor::Bottom => (iced::alignment::Vertical::Bottom, iced::alignment::Horizontal::Center),
                     };
-                    let glass_style = move |radius: f32, shadow: f32| {
+                    let glass_style = move |radius: f32, shadow: f32, strength: f32| {
                         Container::custom(move |theme: &cosmic::Theme| {
                             let cosmic = theme.cosmic();
                             let mut base: iced::Color = cosmic.background(theme.transparent).base.into();
-                            base.a = 0.78 * fade;
+                            base.a = 0.78 * fade * strength;
                             container::Style {
                                 background: Some(Background::Color(base)),
                                 border: Border {
@@ -1864,7 +1912,7 @@ impl cosmic::Application for Taskbar {
                                     ..Default::default()
                                 },
                                 shadow: iced::Shadow {
-                                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, shadow * fade),
+                                    color: iced::Color::from_rgba(0.0, 0.0, 0.0, shadow * fade * strength),
                                     offset: iced::Vector::new(0.0, 8.0),
                                     blur_radius: 28.0,
                                 },
@@ -1872,36 +1920,74 @@ impl cosmic::Application for Taskbar {
                             }
                         })
                     };
-                    // The app's name in a pill over the panel's upper left, as on macOS.
-                    let name = desktop_info.full_name(&self.locales).unwrap_or_default().into_owned();
+                    // A pill over the panel's upper left: the app's name, and the name of
+                    // the window under the pointer while there is one. Its room is always
+                    // kept, so the popup does not resize when it comes and goes.
+                    let hovered_title = self
+                        .hovered_toplevel
+                        .as_ref()
+                        .and_then(|h| toplevels.iter().find(|(i, _)| &i.foreign_toplevel == h))
+                        .map(|(i, _)| i.title.trim().to_owned())
+                        .filter(|t| !t.is_empty());
+                    let many = toplevels.len() > 1;
+                    // The label never goes past the cards: a wider one would widen the
+                    // popup and leave an empty strip the pointer could rest on.
+                    let content_w = toplevels
+                        .iter()
+                        .map(|(_, img)| preview_card_width(img.as_ref()))
+                        .sum::<f32>()
+                        + PREVIEW_PANEL_GAP * toplevels.len().saturating_sub(1) as f32
+                        + 2.0 * PREVIEW_PANEL_PAD;
+                    let label_alpha = if many {
+                        1.0
+                    } else {
+                        toplevels
+                            .iter()
+                            .map(|(i, _)| self.lift_of(&i.foreign_toplevel))
+                            .fold(0.0f32, f32::max)
+                            .clamp(0.0, 1.0)
+                    };
+                    let label = hovered_title
+                        .unwrap_or_else(|| desktop_info.full_name(&self.locales).unwrap_or_default().into_owned());
                     let name_color = {
                         let mut c: iced::Color = theme::active().cosmic().on_bg_color().into();
-                        c.a *= fade;
+                        c.a *= fade * label_alpha;
                         c
                     };
+                    let pill_w = content_w.min(PREVIEW_LABEL_MAX_W);
+                    // Room for the text: the pill less its padding and the little icon.
+                    let (label_size, label_lines) = label_layout(&label, pill_w - 24.0 - 28.0);
                     let pill = container(
                         row![
-                            if fade > 0.6 {
+                            if fade * label_alpha > 0.6 {
                                 Element::from(icon::icon(app_icon.clone()).size(20))
                             } else {
                                 horizontal_space().width(Length::Fixed(20.0)).into()
                             },
-                            text::body(name).class(theme::Text::Color(name_color)),
+                            text(label)
+                                .size(label_size)
+                                .line_height(1.25)
+                                .class(theme::Text::Color(name_color))
+                                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(label_lines as usize))),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center),
                     )
+                    .max_width(pill_w)
                     .padding([6, 12])
-                    .class(glass_style(16.0, 0.25));
-                    // One window: its picture alone, with no panel and no name; two
-                    // or more: the glass panel with the app's name over it.
-                    let stack: Element<_> = if toplevels.len() == 1 {
-                        content
+                    .class(glass_style(16.0, 0.25, label_alpha));
+                    let label_row = container(pill)
+                        .height(Length::Fixed(PREVIEW_LABEL_H))
+                        .align_x(Alignment::Start)
+                        .align_y(Alignment::Start);
+                    // One window: its picture alone, the label only under the pointer;
+                    // two or more: the glass panel, the label always.
+                    let panel: Element<_> = if many {
+                        container(content).class(glass_style(15.0, 0.35, 1.0)).into()
                     } else {
-                        column![container(pill).align_x(Alignment::Start), container(content).class(glass_style(22.0, 0.35))]
-                            .spacing(8)
-                            .into()
+                        content
                     };
+                    let stack: Element<_> = column![label_row, panel].spacing(2).into();
                     mouse_area(
                         cosmic::widget::autosize::autosize(
                             container(stack)
@@ -2080,7 +2166,7 @@ impl cosmic::Application for Taskbar {
             Subscription::none()
         };
         let fade = if self.preview_animating() {
-            iced::time::every(Duration::from_millis(8)).map(|_| Message::PreviewFadeTick)
+            iced::time::every(PREVIEW_FRAME).map(|_| Message::PreviewFadeTick)
         } else {
             Subscription::none()
         };
@@ -2292,14 +2378,19 @@ impl Taskbar {
                     }
                 } else {
                     self.preview_fade.step(1.0, dt, 260.0, 26.0);
-                    if self.preview_fade.settled(1.0) {
+                    if self.preview_fade.settled_loose(1.0) {
                         self.preview_fade = crate::anim::Spring::new(1.0);
                     }
                 }
                 for handle in self.preview_handles() {
                     let target = self.lift_target(&handle);
                     match self.preview_lift.iter_mut().find(|(h, _)| *h == handle) {
-                        Some((_, spring)) => spring.step(target, dt, 380.0, 24.0),
+                        Some((_, spring)) => {
+                            spring.step(target, dt, 380.0, 24.0);
+                            if spring.settled_loose(target) {
+                                *spring = crate::anim::Spring { pos: target, vel: 0.0 };
+                            }
+                        }
                         None => self.preview_lift.push((handle, crate::anim::Spring::new(0.0))),
                     }
                 }
@@ -3113,5 +3204,70 @@ impl AsMimeTypes for DndPathBuf {
 
     fn as_bytes(&self, _mime_type: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
         Some(Cow::Owned(self.0.to_str()?.as_bytes().to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod preview_size_tests {
+    use super::*;
+
+    fn picture(width: u32, height: u32) -> WaylandImage {
+        WaylandImage::new(image::RgbaImage::new(width, height))
+    }
+
+    #[test]
+    fn a_portrait_window_gets_a_card_of_the_minimum_width() {
+        let tall = picture(1080, 1876);
+        let (pw, ph) = preview_picture_size(Some(&tall));
+        assert!(pw < PREVIEW_MIN_CARD_W, "pw={pw}");
+        assert_eq!(ph, PREVIEW_MAX_H);
+        assert_eq!(preview_card_width(Some(&tall)), PREVIEW_MIN_CARD_W);
+    }
+
+    #[test]
+    fn a_wide_window_keeps_its_own_width_up_to_the_maximum() {
+        let ultrawide = picture(3440, 1396);
+        assert_eq!(preview_picture_size(Some(&ultrawide)).0, PREVIEW_MAX_W);
+        assert_eq!(preview_card_width(Some(&ultrawide)), PREVIEW_MAX_W);
+        let hd = picture(1920, 1080);
+        let (pw, ph) = preview_picture_size(Some(&hd));
+        assert!((pw / ph - 16.0 / 9.0).abs() < 0.02, "{pw}x{ph}");
+    }
+
+    #[test]
+    fn no_picture_still_has_a_card_at_least_the_minimum() {
+        assert!(preview_card_width(None) >= PREVIEW_MIN_CARD_W);
+    }
+
+    #[test]
+    fn a_short_title_is_one_line_at_the_normal_size() {
+        assert_eq!(label_layout("Terminal", 300.0), (14.0, 1));
+    }
+
+    #[test]
+    fn a_longer_title_wraps_to_two_lines_before_it_shrinks() {
+        let title = "Visualização em gráfico - Planilha de custos";
+        assert_eq!(label_layout(title, 190.0), (14.0, 2));
+    }
+
+    #[test]
+    fn a_long_title_shrinks_two_points_then_three_then_is_cut() {
+        let long = "Visualização em gráfico das vendas por região 2026";
+        assert_eq!(label_layout(long, 190.0), (12.0, 2));
+        let very_long = "Visualização em gráfico das vendas por região e por mês - Planilha".repeat(2);
+        assert_eq!(label_layout(&very_long, 190.0), (11.0, 2));
+    }
+
+    #[test]
+    fn the_label_layout_survives_an_empty_title_and_no_room() {
+        assert_eq!(label_layout("", 190.0), (14.0, 1));
+        assert_eq!(label_layout("abc", 0.0).1, 2);
+    }
+
+    #[test]
+    fn a_degenerate_picture_does_not_divide_by_zero() {
+        let empty = picture(0, 0);
+        let (pw, ph) = preview_picture_size(Some(&empty));
+        assert!(pw > 0.0 && ph > 0.0);
     }
 }
