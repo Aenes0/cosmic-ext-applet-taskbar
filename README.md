@@ -1,3 +1,7 @@
+> **Projeto depreciado.** A barra de tarefas e o menu Iniciar foram unificados em um programa só:
+> **[Aenes0/cosmic-taskbar](https://github.com/Aenes0/cosmic-taskbar)**, que tem o histórico deste
+> repositório e recebe todas as correções daqui em diante. Este repositório fica arquivado, somente leitura.
+
 # Barra de tarefas — a bandeja de apps do Windows 11 para o COSMIC
 
 > Fork da [bandeja de apps](https://github.com/pop-os/cosmic-applets/tree/master/cosmic-app-list)
